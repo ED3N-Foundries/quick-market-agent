@@ -1,4 +1,4 @@
-FROM oven/bun:1.4.3-alpine
+FROM oven/bun:1.4.4-alpine
 USER root
 RUN apk add --no-cache su-exec
 WORKDIR /app
