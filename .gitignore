@@ -1,0 +1,17 @@
+node_modules
+data/*.sqlite
+data/*.sqlite-wal
+data/*.sqlite-shm
+.DS_Store
+.env
+.env.*
+!.env.example
+agent/keys.json
+agent/keys.near.json
+agent/status.json
+agent/swarm.json
+agent/flow.json
+agent/*.sqlite
+agent/*.sqlite-wal
+agent/*.sqlite-shm
+agent/*.tmp
