@@ -4,6 +4,7 @@ import { privateKeyToAccount } from "viem/accounts"
 import { requireSepoliaToken } from "../shared/chain"
 import { botEnrollMessage, nearBotEnrollMessage } from "../shared/login"
 import { loadMarket, marketPreferences, requireExplicitChain } from "../shared/market"
+import { parseAgentSplit } from "../shared/split"
 import { requireNearToken } from "../shared/near"
 import { accountFromSecret, signNearMessage } from "../shared/nearKey"
 import { feeBps, windowMs } from "../server/config"
@@ -111,6 +112,21 @@ async function main() {
   }
   if (marketPreferences.chain === "base") {
     console.error("The swarm refuses CHAIN=base. Real USDC is out of this mode.")
+    process.exit(1)
+  }
+  let split
+  try {
+    split = parseAgentSplit(process.env.AGENT_SPLIT_BASE, process.env.AGENT_SPLIT_NEAR)
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : error)
+    process.exit(1)
+  }
+  if (split.near !== 0) {
+    console.error("NEAR agent trading is not enabled. Set AGENT_SPLIT_NEAR=0.")
+    process.exit(1)
+  }
+  if (marketPreferences.chain === "near-testnet") {
+    console.error("The swarm does not run on NEAR.")
     process.exit(1)
   }
   const problem = checkConfig(swarmConfig)

@@ -2,6 +2,7 @@ import { existsSync } from "node:fs"
 import { join } from "node:path"
 import { Database } from "bun:sqlite"
 import { marketPreferences } from "../shared/market"
+import { parseAgentSplit } from "../shared/split"
 import { loadEnv } from "../server/env"
 import { peekApiEndpoint, refreshApiEndpoint, type ApiTarget } from "./endpoint"
 import { CONTROL_PATH, STATUS_PATH, SWARM_PATH, readJson, writeJsonAtomic } from "./store"
@@ -192,11 +193,19 @@ export function histogramLine(snapshot: SwarmSnapshot): string {
   return snapshot.money.histogram.map((band) => `${band.band} ${band.count}`).join("   ")
 }
 
-export function statusLine(control: ControlFile): string {
+function shownSplit(): { base: number; near: number } {
+  try {
+    return parseAgentSplit(process.env.AGENT_SPLIT_BASE, process.env.AGENT_SPLIT_NEAR)
+  } catch {
+    return { base: 100, near: 0 }
+  }
+}
+
+export function statusLine(control: ControlFile, split: { base: number; near: number } = { base: 100, near: 0 }): string {
   const mode = control.mode === "pin" ? `pin ${control.pin ?? 1}` : control.mode
   const buyIns = control.buyInPaused ? "buy-ins paused" : "buy-ins on"
   const bleed = control.bleed ? "bleed on" : "bleed off"
-  return `${mode}  ·  ${buyIns}  ·  ${bleed}  ·  paused ${control.paused.length}`
+  return `${mode}  ·  ${buyIns}  ·  ${bleed}  ·  paused ${control.paused.length}  ·  split base ${split.base} / near ${split.near}`
 }
 
 export type RowTone = "text" | "muted" | "gold" | "up" | "down"
@@ -287,7 +296,7 @@ export function renderSnapshot(
     moneyLine(snapshot, control, true),
     histogramLine(snapshot),
     snapshot.lastError ? `error ${snapshot.lastError}` : "",
-    statusLine(control),
+    statusLine(control, shownSplit()),
     runnerActionLine(alive, typeof snapshot.pid === "number" ? snapshot.pid : null, null),
     ...(state.help ? HELP_LINES : []),
   ].filter((line) => line !== "")

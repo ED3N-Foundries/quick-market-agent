@@ -3,6 +3,7 @@ import { createCliRenderer, type MouseEvent } from "@opentui/core"
 import { createRoot, useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react"
 import { useEffect, useRef, useState } from "react"
 import { loadEnv } from "../server/env"
+import { parseAgentSplit } from "../shared/split"
 import {
   HELP_LINES,
   connectionOf,
@@ -368,6 +369,13 @@ function ConfirmLine({
 
 function Status({ control }: { control: ControlFile }) {
   const mode = control.mode === "pin" ? `pin ${control.pin ?? 1}` : control.mode
+  const split = (() => {
+    try {
+      return parseAgentSplit(process.env.AGENT_SPLIT_BASE, process.env.AGENT_SPLIT_NEAR)
+    } catch {
+      return { base: 100, near: 0 }
+    }
+  })()
   return (
     <box style={{ height: 1, flexDirection: "row", flexShrink: 1 }}>
       <Text fg={control.mode === "clock" ? text : gold}>{mode}</Text>
@@ -376,6 +384,7 @@ function Status({ control }: { control: ControlFile }) {
       <Text fg={muted}>  ·  </Text>
       <Text fg={control.bleed ? text : gold}>{control.bleed ? "bleed on" : "bleed off"}</Text>
       <Text>  ·  paused {control.paused.length}</Text>
+      <Text fg={muted}>{`  ·  split base ${split.base} / near ${split.near}`}</Text>
     </box>
   )
 }
