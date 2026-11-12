@@ -72,6 +72,7 @@ function wallet(): WalletRow {
     wokeAt: 1,
     sleptAt: null,
     updatedAt: 1,
+    token: null,
   }
 }
 

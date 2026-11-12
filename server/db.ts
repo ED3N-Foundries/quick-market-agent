@@ -109,6 +109,7 @@ const CHAIN_TABLES: Record<string, string> = {
     woke_at INTEGER,
     slept_at INTEGER,
     updated_at INTEGER,
+    token TEXT,
     PRIMARY KEY (chain_key, address)
   )`,
   windows: `CREATE TABLE IF NOT EXISTS windows (

@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS wallets (
   woke_at INTEGER,
   slept_at INTEGER,
   updated_at INTEGER,
+  token TEXT,
   PRIMARY KEY (chain_key, address)
 );
 CREATE TABLE IF NOT EXISTS windows (
@@ -81,16 +82,25 @@ export type WalletRow = {
   wokeAt: number | null
   sleptAt: number | null
   updatedAt: number
+  token: string | null
 }
 
 export type RosterFilter = "all" | "stuck" | "richest" | "woke" | "slept"
 
 export function openSwarm(source: string | Database): Database {
-  if (typeof source !== "string") return source
+  const db = typeof source === "string" ? openFile(source) : source
+  db.exec(SCHEMA)
+  const columns = db.query("PRAGMA table_info(wallets)").all() as { name: string }[]
+  if (columns.length > 0 && !columns.some((column) => column.name === "token")) {
+    db.exec("ALTER TABLE wallets ADD COLUMN token TEXT")
+  }
+  return db
+}
+
+function openFile(source: string): Database {
   if (source !== ":memory:") mkdirSync(dirname(source), { recursive: true })
   const db = new Database(source)
   tuneDatabase(db, { memory: source === ":memory:" })
-  db.exec(SCHEMA)
   return db
 }
 
@@ -127,8 +137,8 @@ export function saveWallets(db: Database, rows: WalletRow[], chainKey = activeCh
       `INSERT INTO wallets (
          chain_key, address, idx, online, phase, bankroll, last_side, last_stake, last_skip, wins, losses,
          mind, tempo, visit_end, enrolled, rng_a, gate_json, cursor, visit_start, gap_end,
-         handled, woke_at, slept_at, updated_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         handled, woke_at, slept_at, updated_at, token
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(chain_key, address) DO UPDATE SET
          idx = excluded.idx, online = excluded.online, phase = excluded.phase, bankroll = excluded.bankroll,
          last_side = excluded.last_side, last_stake = excluded.last_stake, last_skip = excluded.last_skip,
@@ -136,7 +146,7 @@ export function saveWallets(db: Database, rows: WalletRow[], chainKey = activeCh
          visit_end = excluded.visit_end, enrolled = excluded.enrolled, rng_a = excluded.rng_a,
          gate_json = excluded.gate_json, cursor = excluded.cursor, visit_start = excluded.visit_start,
          gap_end = excluded.gap_end, handled = excluded.handled, woke_at = excluded.woke_at,
-         slept_at = excluded.slept_at, updated_at = excluded.updated_at`,
+         slept_at = excluded.slept_at, updated_at = excluded.updated_at, token = excluded.token`,
     )
     for (const row of rows) {
       statement.run(
@@ -164,6 +174,7 @@ export function saveWallets(db: Database, rows: WalletRow[], chainKey = activeCh
         row.wokeAt,
         row.sleptAt,
         row.updatedAt,
+        row.token,
       )
     }
   })
@@ -284,5 +295,6 @@ function mapRow(row: Record<string, unknown>): WalletRow {
     wokeAt: row.woke_at == null ? null : Number(row.woke_at),
     sleptAt: row.slept_at == null ? null : Number(row.slept_at),
     updatedAt: Number(row.updated_at ?? 0),
+    token: row.token == null ? null : String(row.token),
   }
 }

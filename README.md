@@ -6,8 +6,8 @@ runner code. This repo is private.
 
 One Bun process keeps a crowd of durable wallets whose size glides between a
 few hundred and a few thousand. Each wallet buys in for itself. Surplus over
-$1,000 is burned. Balances under $3 are refilled. `AGENT_SECRET` authorizes
-the runner against the server. The swarm refuses `CHAIN=base`.
+$1,000 is withdrawn to that wallet. Balances under $3 stay put. The runner
+does not claim the testnet grant. The swarm refuses `CHAIN=base`.
 
 ## Run
 
@@ -29,13 +29,16 @@ SQLite file, not the server ledger.
 
 ## Server contract
 
-The server keeps the bot API; this runner is its only client:
+The runner is an MCP client of `API_URL` + `/mcp?chain=`. One long-lived
+session. Inside compose that URL is `http://quick-market:3001/mcp?chain=`.
 
-- `GET /api/agents/book`, `GET /api/agents/balances`
-- `POST /api/agents/enroll`, `POST /api/agents/buy-ins`
-- `POST /api/agents/burn`, `POST /api/agents/resurrect`
-
-All require `x-agent-secret: AGENT_SECRET`.
+- Sign each wallet in once. The wallet signs the normal login message,
+  `sign_in` opens the session, and the token stays in this database.
+- `book` and `rounds` feed the local payout replay. `FEE_BPS` stays here.
+- Each wave is `place_buy_ins`, up to 200 orders.
+- Drift is corrected with `account` on the signed-in wallets, in slices.
+- Surplus leaves through `withdraw`, which debits the ledger and pays the wallet.
+- The runner does not call `claim_grant`. A new wallet starts at 0.
 
 ## Layout
 
@@ -47,8 +50,8 @@ All require `x-agent-secret: AGENT_SECRET`.
 `server/db.ts` keeps the full schema so the copied `importLegacySwarm`
 still runs; only the agent tables are used here. `server/nearInspect.ts`
 is the read-only fork of the server's NEAR module: no ledger writes, no
-custody polling, no transaction submission. Mints and burns go through the
-server API.
+custody polling, no transaction submission. Buy-ins and withdrawals go
+through the public MCP server.
 
 ## Config
 

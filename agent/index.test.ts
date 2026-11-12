@@ -4,6 +4,8 @@ import { readFileSync } from "node:fs"
 test("the runner does not keep the faucet loop", () => {
   const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8")
   expect(source).toContain("The swarm refuses CHAIN=base")
+  expect(source).not.toContain("/api/agents")
+  expect(source).not.toContain("x-agent-secret")
   expect(source).not.toContain("needsFaucet")
   expect(source).not.toContain("requestFaucet")
   expect(source).not.toContain("balanceOf")

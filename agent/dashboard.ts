@@ -378,7 +378,6 @@ export function runnerConfirmLine(prompt: RunnerPrompt, pid: number | null): str
 
 export function runnerBlock(): string | null {
   if (marketPreferences.chain === "base") return "The swarm refuses CHAIN=base. Real USDC is out of this mode."
-  if (!loadEnv().agentSecret) return "AGENT_SECRET is required"
   return null
 }
 

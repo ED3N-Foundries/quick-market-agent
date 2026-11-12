@@ -3,7 +3,7 @@ USER root
 RUN apk add --no-cache su-exec
 WORKDIR /app
 COPY package.json bun.lock ./
-RUN bun install --frozen-lockfile --production
+RUN bun install --frozen-lockfile --production --ignore-scripts
 COPY agent ./agent
 COPY shared ./shared
 COPY server ./server

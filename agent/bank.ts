@@ -5,7 +5,6 @@ import type { BankConfig } from "./config"
 
 export type BankAction =
   | { kind: "none" }
-  | { kind: "mint"; amountMicros: number; pocketMicros: number }
   | { kind: "burn"; amountMicros: number; pocketMicros: number }
 
 function pocket(index: number, salt: number, low: number, high: number): number {
@@ -28,12 +27,7 @@ export function burnPocket(index: number, config: BankConfig): number {
 
 export function bankAction(balanceMicros: number, index: number, config: BankConfig, handled: boolean): BankAction {
   if (handled) return { kind: "none" }
-  if (balanceMicros < config.floorMicros) {
-    const pocketMicros = refillPocket(index, config)
-    const amountMicros = pocketMicros - balanceMicros
-    if (amountMicros <= 0) return { kind: "none" }
-    return { kind: "mint", amountMicros, pocketMicros }
-  }
+  if (balanceMicros < config.floorMicros) return { kind: "none" }
   if (balanceMicros > config.capMicros) {
     const pocketMicros = burnPocket(index, config)
     const amountMicros = balanceMicros - pocketMicros

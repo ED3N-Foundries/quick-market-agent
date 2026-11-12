@@ -1,17 +1,20 @@
+import * as ed from "@noble/ed25519"
+import bs58 from "bs58"
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { dirname } from "node:path"
 import { privateKeyToAccount } from "viem/accounts"
 import { requireSepoliaToken } from "../shared/chain"
-import { botEnrollMessage, nearBotEnrollMessage } from "../shared/login"
+import { loginMessage, nearLoginMessage } from "../shared/login"
 import { loadMarket, marketPreferences, requireExplicitChain } from "../shared/market"
 import { parseAgentSplit } from "../shared/split"
 import { requireNearToken } from "../shared/near"
-import { accountFromSecret, signNearMessage } from "../shared/nearKey"
+import { accountFromSecret, NEP413_RECIPIENT, nep413Bytes, publicKeyBytes, seedFromSecret, sha256Bytes } from "../shared/nearKey"
 import { feeBps, windowMs } from "../server/config"
 import { configuredChain, loadEnv } from "../server/env"
 import { getDb, importLegacySwarm } from "../server/db"
 import { assertQmMetadata, fundedAgents, inspectNear, NearConfigError, readTokenMetadata } from "../server/nearInspect"
-import { bankAction, seedMicros } from "./bank"
+import { bankAction } from "./bank"
+import { callMarket, liveBook, openMarket, recentRounds, settledRounds, type ToolReply } from "./mcp"
 import { checkConfig, swarmConfig, type TapeStats } from "./config"
 import { admitWallet, decideOpen, freshGate, noteResult, tapeActivity, type GateState, type PrintPoint, type Side } from "./decide"
 import { fireAt, releaseWave, type FireSlot } from "./schedule"
@@ -80,6 +83,8 @@ type LiveWallet = {
   wokeAt: number | null
   sleptAt: number | null
   nextEnroll: number
+  token: string | null
+  bound: boolean
   dirty: boolean
 }
 
@@ -96,10 +101,6 @@ type Wave = {
   endsAt: number
   queue: FireSlot[]
   taken: number
-}
-
-function apiRoot(): string {
-  return loadEnv().apiUrl.replace(/\/api\/session\/?$/, "").replace(/\/$/, "")
 }
 
 async function main() {
@@ -132,10 +133,6 @@ async function main() {
   const problem = checkConfig(swarmConfig)
   if (problem) {
     console.error(problem)
-    process.exit(1)
-  }
-  if (!loadEnv().agentSecret) {
-    console.error("AGENT_SECRET is required")
     process.exit(1)
   }
   const chain = configuredChain()
@@ -181,14 +178,20 @@ async function main() {
   const wallets = new Map<string, LiveWallet>()
   const stored = loadWalletMap(db)
   keys.forEach((key, index) => remember(wallets, key, stored.get(key.address.toLowerCase()) ?? null, index, funded))
-  const existingBalances = await fetchBalances([...wallets.keys()])
-  for (const row of existingBalances) {
-    const wallet = wallets.get(row.address)
-    if (!wallet) continue
-    wallet.enrolled = true
-    wallet.bankroll = row.balanceMicros
-    wallet.dirty = true
+  try {
+    await openMarket(loadEnv().apiUrl, marketPreferences.chain)
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : error)
   }
+  await pool(
+    [...wallets.values()].filter((wallet) => wallet.enrolled),
+    swarmConfig.runner.enrollWidth,
+    async (wallet) => {
+      await bindWallet(wallets, wallet, chain.id, (message) => {
+        console.error(message)
+      })
+    },
+  )
   const initialSteer = steering()
   const storedSpring = metaGet(db, "spring") !== null ? Number(metaGet(db, "spring")) : null
   const defaultSpring =
@@ -417,7 +420,8 @@ async function main() {
       while (recent.length > 0 && now - recent[0]!.at > swarmConfig.presence.herdWindowMs) recent.shift()
 
       flush()
-      if (!enrolling && enrolledWallets.length < Math.min(swarmConfig.runner.keyCap, Math.ceil(view.online))) {
+      const needsSignIn = [...wallets.values()].some((wallet) => wallet.enrolled && !wallet.bound && wallet.nextEnroll <= now)
+      if (!enrolling && (needsSignIn || enrolledWallets.length < Math.min(swarmConfig.runner.keyCap, Math.ceil(view.online)))) {
         enrolling = true
         void enrollDue(wallets, chain.id, now, Math.ceil(view.online), flow, (message) => {
           lastError = message
@@ -458,7 +462,7 @@ async function main() {
         const queue: FireSlot[] = []
         let skips = 0
         for (const wallet of wallets.values()) {
-          if (!wallet.online || !wallet.enrolled) continue
+          if (!wallet.online || !wallet.enrolled || !wallet.bound) continue
           const admitted = admitWallet({
             wallet: {
               index: wallet.index,
@@ -682,6 +686,8 @@ function remember(
     wokeAt: row?.wokeAt ?? null,
     sleptAt: row?.sleptAt ?? null,
     nextEnroll: 0,
+    token: row?.token ?? null,
+    bound: false,
     dirty: false,
   })
 }
@@ -734,6 +740,7 @@ function toRow(wallet: LiveWallet): WalletRow {
     wokeAt: wallet.wokeAt,
     sleptAt: wallet.sleptAt,
     updatedAt: Date.now(),
+    token: wallet.token,
   }
 }
 
@@ -742,45 +749,110 @@ async function enrollDue(
   chainId: number,
   now: number,
   wantedOnline: number,
-  flow: FlowFile,
+  _flow: FlowFile,
   fail: (message: string) => void,
 ) {
+  const repair = [...wallets.values()].filter((wallet) => wallet.enrolled && !wallet.bound && wallet.nextEnroll <= now)
   const enrolledCount = walletsEnrolled(wallets)
   const needed = Math.max(0, Math.min(swarmConfig.runner.keyCap, wantedOnline) - enrolledCount)
-  if (needed === 0) return
-  const due = [...wallets.values()]
-    .filter((wallet) => !wallet.enrolled && wallet.nextEnroll <= now)
-    .sort((left, right) => left.index - right.index)
-    .slice(0, Math.min(needed, swarmConfig.runner.enrollWidth))
+  const fresh =
+    needed === 0
+      ? []
+      : [...wallets.values()]
+          .filter((wallet) => !wallet.enrolled && wallet.nextEnroll <= now)
+          .sort((left, right) => left.index - right.index)
+          .slice(0, Math.min(needed, swarmConfig.runner.enrollWidth))
+  const due = repair.length > swarmConfig.runner.enrollWidth ? repair : [...repair, ...fresh].slice(0, swarmConfig.runner.enrollWidth)
+  if (due.length === 0) return
   await pool(due, swarmConfig.runner.enrollWidth, async (wallet) => {
-    const seed = seedMicros(wallet.index, swarmConfig.bank)
-    const issued = Date.now()
-    const signature =
-      marketPreferences.chain === "near-testnet"
-        ? await signNearMessage(nearBotEnrollMessage(wallet.address, issued, seed), wallet.privateKey)
-        : await privateKeyToAccount(wallet.privateKey as `0x${string}`).signMessage({
-            message: botEnrollMessage(chainId, wallet.address, issued, seed),
-          })
-    if (!signature) {
-      wallet.nextEnroll = Date.now() + 5_000
-      fail("Enroll failed")
-      return
-    }
-    const response = await api("/api/agents/enroll", {
-      method: "POST",
-      body: JSON.stringify({ address: wallet.address, signature, issued, seedMicros: seed }),
-    })
-    const body = response.body as { balanceMicros?: number; seeded?: boolean; error?: string } | null
-    if (!response.ok || !body || typeof body.balanceMicros !== "number") {
-      wallet.nextEnroll = Date.now() + 5_000
-      fail(body?.error ?? "Enroll failed")
-      return
-    }
-    if (body.seeded) flow.seedMicros += seed
-    wallet.enrolled = true
-    wallet.bankroll = body.balanceMicros
-    wallet.dirty = true
+    await bindWallet(wallets, wallet, chainId, fail)
   })
+}
+
+async function bindWallet(wallets: Map<string, LiveWallet>, wallet: LiveWallet, chainId: number, fail: (message: string) => void) {
+  if (wallet.token) {
+    const rebound = await callMarket("sign_in", { token: wallet.token })
+    if (rebound.transport) {
+      noteTransport(wallets, rebound)
+      wallet.nextEnroll = Date.now() + 5_000
+      fail(toolError(rebound))
+      return
+    }
+    if (rebound.ok && rebound.body.address === wallet.address && typeof rebound.body.balanceMicros === "number") {
+      wallet.bound = true
+      wallet.enrolled = true
+      wallet.bankroll = rebound.body.balanceMicros
+      wallet.dirty = true
+      return
+    }
+  }
+  const issued = Date.now()
+  const signed = await signLogin(wallet, chainId, issued)
+  if (!signed) {
+    wallet.bound = false
+    wallet.nextEnroll = Date.now() + 5_000
+    fail("Enroll failed")
+    return
+  }
+  const opened = await callMarket("sign_in", {
+    address: wallet.address,
+    signature: signed.signature,
+    issued,
+    ...(signed.nonce ? { nonce: signed.nonce, publicKey: signed.publicKey } : {}),
+  })
+  if (opened.transport) {
+    noteTransport(wallets, opened)
+    wallet.nextEnroll = Date.now() + 5_000
+    fail(toolError(opened))
+    return
+  }
+  const token = opened.body.token
+  if (!opened.ok || opened.body.address !== wallet.address || typeof opened.body.balanceMicros !== "number" || typeof token !== "string") {
+    wallet.bound = false
+    wallet.nextEnroll = Date.now() + 5_000
+    fail(toolError(opened))
+    return
+  }
+  wallet.token = token
+  wallet.enrolled = true
+  wallet.bound = true
+  wallet.bankroll = opened.body.balanceMicros
+  wallet.dirty = true
+}
+
+async function signLogin(
+  wallet: LiveWallet,
+  chainId: number,
+  issued: number,
+): Promise<{ signature: string; nonce?: string; publicKey?: string } | null> {
+  if (marketPreferences.chain === "near-testnet") {
+    const nonce = crypto.getRandomValues(new Uint8Array(32))
+    const seed = seedFromSecret(wallet.privateKey)
+    const pub = await publicKeyBytes(wallet.privateKey)
+    if (!seed || !pub) return null
+    const signature = await ed.signAsync(sha256Bytes(nep413Bytes(nearLoginMessage(wallet.address, issued), nonce, NEP413_RECIPIENT)), seed)
+    return { signature: hex(signature), nonce: Buffer.from(nonce).toString("base64"), publicKey: `ed25519:${bs58.encode(pub)}` }
+  }
+  const signature = await privateKeyToAccount(wallet.privateKey as `0x${string}`).signMessage({
+    message: loginMessage(chainId, wallet.address, issued),
+  })
+  return { signature }
+}
+
+function hex(bytes: Uint8Array): string {
+  return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("")
+}
+
+function noteTransport(wallets: Map<string, LiveWallet>, reply: ToolReply) {
+  if (!reply.transport) return
+  for (const wallet of wallets.values()) {
+    wallet.bound = false
+    wallet.nextEnroll = 0
+  }
+}
+
+function toolError(reply: ToolReply): string {
+  return typeof reply.body.error === "string" ? reply.body.error : "Enroll failed"
 }
 
 async function loadBook(
@@ -789,17 +861,37 @@ async function loadBook(
   readCursor: () => number,
   writeCursor: (value: number) => void,
 ): Promise<Book | null> {
-  let latest = await fetchBook(readCursor())
-  if (!latest) return null
-  for (;;) {
-    const before = readCursor()
-    await applySettled(db, wallets, latest, readCursor, writeCursor)
-    if (latest.settled.length < 200 || readCursor() <= before) break
-    const more = await fetchBook(readCursor())
-    if (!more) break
-    latest = more
+  const live = await callMarket("book", { tailMs: swarmConfig.runner.tapeTailMs })
+  if (live.transport) {
+    noteTransport(wallets, live)
+    return null
   }
-  return latest
+  if (!live.ok) return null
+  const board = liveBook(live.body)
+  if (!board) return null
+  const settled: Book["settled"] = []
+  let scan = readCursor()
+  for (;;) {
+    const page = await callMarket("rounds", { limit: 100, after: scan })
+    if (page.transport) {
+      noteTransport(wallets, page)
+      break
+    }
+    if (!page.ok) break
+    const rows = settledRounds(page.body)
+    if (!rows || rows.length === 0) break
+    const last = rows[rows.length - 1]
+    if (!last || last.id <= scan) break
+    settled.push(...rows)
+    scan = last.id
+    if (rows.length < 100) break
+  }
+  const recentPage = await callMarket("rounds", { limit: 8 })
+  if (recentPage.transport) noteTransport(wallets, recentPage)
+  const recent = recentPage.ok ? (recentRounds(recentPage.body) ?? []) : []
+  const book: Book = { ...board, settled, recent }
+  await applySettled(db, wallets, book, readCursor, writeCursor)
+  return book
 }
 
 async function applySettled(
@@ -824,13 +916,10 @@ async function applySettled(
         voided: settled.resolution === "void",
       })
       const payouts = outcome.payouts.filter((payout) => payout.address !== "other")
-      const balances = await fetchBalances(payouts.map((payout) => payout.address))
-      const byAddress = new Map(balances.map((row) => [row.address, row.balanceMicros]))
       for (const payout of payouts) {
         const wallet = wallets.get(payout.address)
         if (!wallet) continue
-        const audited = byAddress.get(payout.address)
-        wallet.bankroll = audited ?? wallet.bankroll + payout.payoutMicros
+        wallet.bankroll += payout.payoutMicros
         if (outcome.resolution === "paid") {
           const won = payout.payoutMicros > 0
           wallet.gate = noteResult(wallet.gate, won, wallet.persona, swarmConfig.persona)
@@ -860,26 +949,25 @@ async function postOrders(
   while (pending.sent < pending.orders.length) {
     if (Date.now() >= pending.endsAt - 150) return { done: false, count, up, down, stakes }
     const part = pending.orders.slice(pending.sent, pending.sent + swarmConfig.runner.betChunk)
-    const response = await api("/api/agents/buy-ins", {
-      method: "POST",
-      body: JSON.stringify({ orders: part, roundId: pending.roundId }),
-    })
-    const body = response.body as
-      | { error?: string; code?: string; results?: { address: string; ok: boolean; error?: string }[] }
-      | null
-    if (!response.ok || !body?.results) {
-      fail(body?.error ?? "Buy-in chunk failed")
-      if (body?.code === "late" || body?.error === "Buy-in is closed" || body?.error === "Price feed is delayed") {
+    const response = await callMarket("place_buy_ins", { orders: part, roundId: pending.roundId })
+    if (response.transport) noteTransport(wallets, response)
+    const results = Array.isArray(response.body.results)
+      ? (response.body.results as { address?: unknown; ok?: unknown; balanceMicros?: unknown }[])
+      : null
+    if (!response.ok || !results) {
+      const error = typeof response.body.error === "string" ? response.body.error : "Buy-in chunk failed"
+      fail(error)
+      if (response.body.code === "late" || error === "Buy-in is closed" || error === "Price feed is delayed") {
         return { done: true, count, up, down, stakes }
       }
       return { done: false, count, up, down, stakes }
     }
-    for (const result of body.results) {
-      if (!result.ok) continue
+    for (const result of results) {
+      if (result.ok !== true || typeof result.address !== "string") continue
       const order = part.find((item) => item.address === result.address)
       const wallet = wallets.get(result.address)
       if (!order || !wallet) continue
-      wallet.bankroll -= order.stakeMicros
+      wallet.bankroll = typeof result.balanceMicros === "number" ? result.balanceMicros : wallet.bankroll - order.stakeMicros
       wallet.lastSide = order.side
       wallet.lastStake = order.stakeMicros
       wallet.lastSkip = null
@@ -898,17 +986,24 @@ async function postOrders(
 }
 
 async function audit(wallets: Map<string, LiveWallet>, cursor: number, setCursor: (value: number) => void) {
-  const enrolled = [...wallets.values()].filter((wallet) => wallet.enrolled)
+  const enrolled = [...wallets.values()].filter((wallet) => wallet.enrolled && wallet.bound)
   if (enrolled.length === 0) return
   const start = cursor >= enrolled.length ? 0 : cursor
   const slice = enrolled.slice(start, start + swarmConfig.runner.auditSlice)
-  const balances = await fetchBalances(slice.map((wallet) => wallet.address))
-  for (const row of balances) {
-    const wallet = wallets.get(row.address)
-    if (!wallet) continue
-    wallet.bankroll = row.balanceMicros
-    wallet.dirty = true
-  }
+  let dropped = false
+  await pool(slice, swarmConfig.runner.enrollWidth, async (wallet) => {
+    if (dropped) return
+    const response = await callMarket("account", { address: wallet.address })
+    if (response.transport) {
+      noteTransport(wallets, response)
+      dropped = true
+      return
+    }
+    if (response.ok && response.body.address === wallet.address && typeof response.body.balanceMicros === "number") {
+      wallet.bankroll = response.body.balanceMicros
+      wallet.dirty = true
+    }
+  })
   const next = start + slice.length
   setCursor(next >= enrolled.length ? 0 : next)
 }
@@ -924,56 +1019,22 @@ async function bankPass(wallets: Map<string, LiveWallet>, flow: FlowFile, fail: 
       }
       continue
     }
-    if (action.kind === "mint") {
-      const response = await api("/api/agents/resurrect", {
-        method: "POST",
-        body: JSON.stringify({ address: wallet.address, amountMicros: action.amountMicros }),
-      })
-      const body = response.body as { balanceMicros?: number; error?: string } | null
-      if (!response.ok || typeof body?.balanceMicros !== "number") {
-        fail(body?.error ?? "Floor mint failed")
-        continue
-      }
-      wallet.bankroll = body.balanceMicros
-      wallet.handled = true
-      wallet.dirty = true
-      flow.mintMicros += action.amountMicros
+    if (!wallet.bound) continue
+    const response = await callMarket("withdraw", { address: wallet.address, amountMicros: action.amountMicros })
+    if (response.transport) {
+      noteTransport(wallets, response)
+      fail(typeof response.body.error === "string" ? response.body.error : "Withdraw failed")
+      return
+    }
+    if (!response.ok || typeof response.body.balanceMicros !== "number") {
+      fail(typeof response.body.error === "string" ? response.body.error : "Withdraw failed")
       continue
     }
-    const response = await api("/api/agents/burn", {
-      method: "POST",
-      body: JSON.stringify({ address: wallet.address, amountMicros: action.amountMicros }),
-    })
-    const body = response.body as { you?: { balanceMicros?: number }; error?: string } | null
-    if (!response.ok || typeof body?.you?.balanceMicros !== "number") {
-      fail(body?.error ?? "Burn failed")
-      continue
-    }
-    wallet.bankroll = body.you.balanceMicros
+    wallet.bankroll = response.body.balanceMicros
     wallet.handled = true
     wallet.dirty = true
     flow.burnMicros += action.amountMicros
   }
-}
-
-async function fetchBalances(addresses: string[]): Promise<{ address: string; balanceMicros: number }[]> {
-  const out: { address: string; balanceMicros: number }[] = []
-  for (let index = 0; index < addresses.length; index += swarmConfig.runner.auditSlice) {
-    const slice = addresses.slice(index, index + swarmConfig.runner.auditSlice)
-    if (slice.length === 0) continue
-    const response = await api(`/api/agents/balances?addresses=${slice.join(",")}`)
-    const body = response.body as { balances?: { address: string; balanceMicros: number }[] } | null
-    if (response.ok && body?.balances) out.push(...body.balances)
-  }
-  return out
-}
-
-async function fetchBook(since: number): Promise<Book | null> {
-  const response = await api(`/api/agents/book?since=${since}&tail=${swarmConfig.runner.tapeTailMs}`)
-  if (!response.ok || !response.body) return null
-  const body = response.body as Partial<Book>
-  if (typeof body.joinId !== "number" || !Array.isArray(body.tape) || !Array.isArray(body.settled)) return null
-  return { ...body, recent: Array.isArray(body.recent) ? body.recent : [] } as Book
 }
 
 function settlesOf(recent: Book["recent"] | undefined): Side[] {
@@ -983,23 +1044,6 @@ function settlesOf(recent: Book["recent"] | undefined): Side[] {
     if (row.winningSide === "up" || row.winningSide === "down") sides.push(row.winningSide)
   }
   return sides
-}
-
-async function api(path: string, init?: RequestInit): Promise<{ ok: boolean; body: unknown }> {
-  try {
-    const response = await fetch(`${apiRoot()}${path}`, {
-      ...init,
-      headers: {
-        "content-type": "application/json",
-        "x-agent-secret": loadEnv().agentSecret,
-        ...(init?.headers ?? {}),
-      },
-    })
-    const body = await response.json().catch(() => null)
-    return { ok: response.ok, body }
-  } catch (error) {
-    return { ok: false, body: { error: error instanceof Error ? error.message : "The book is unreachable" } }
-  }
 }
 
 function pointsOf(tape: { t: number; price: string }[], now: number): PrintPoint[] {
