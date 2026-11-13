@@ -15,7 +15,7 @@ function whole(value: unknown): number | null {
   return Number(value.trim())
 }
 
-/** Unset lines mean the whole swarm stays on Base. Any explicit line must be a whole number, and the two shares must sum to 100. */
+/** Unset lines mean the whole swarm stays on Base. A share of 0 turns that market's runner off. Any explicit line must be a whole number, and the two shares must sum to 100. */
 export function parseAgentSplit(baseValue: unknown, nearValue: unknown): AgentSplit {
   if (blank(baseValue) && blank(nearValue)) return { base: 100, near: 0 }
   const base = whole(baseValue)

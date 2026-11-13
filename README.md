@@ -7,14 +7,23 @@ runner code. This repo is private.
 One Bun process keeps a crowd of durable wallets whose size glides between a
 few hundred and a few thousand. Each wallet buys in for itself. Surplus over
 $1,000 is withdrawn to that wallet. Balances under $3 stay put. The runner
-does not claim the testnet grant. The swarm refuses `CHAIN=base`.
+does not call `claim_grant`. The first sign-in still takes the market's
+testnet grant. The swarm refuses `CHAIN=base` (real USDC).
+
+Base Sepolia and NEAR testnet each have a runner. `AGENT_SPLIT_BASE` and
+`AGENT_SPLIT_NEAR` are whole numbers that sum to 100. A share of 0 keeps
+that runner off. Each runner trades every wallet on its own chain. The NEAR
+runner reads `NEAR_TREASURY_PRIVATE_KEY` and writes `agent/keys.near.json`.
+Buy-ins are ledger sessions, so an implicit account can bet before it holds
+on-chain NEAR.
 
 ## Run
 
 ```bash
 bun install
 bun test
-CHAIN=base-sepolia API_URL=http://127.0.0.1:3001 DB_PATH=data/quick-market-agent.sqlite bun run agent
+CHAIN=base-sepolia AGENT_SPLIT_BASE=50 AGENT_SPLIT_NEAR=50 API_URL=http://127.0.0.1:3001 DB_PATH=data/quick-market-agent.sqlite bun run agent
+CHAIN=near-testnet AGENT_SPLIT_BASE=50 AGENT_SPLIT_NEAR=50 API_URL=http://127.0.0.1:3001 DB_PATH=data/quick-market-agent-near.sqlite bun run agent
 ```
 
 `bun run agents` is the terminal dashboard. It reads `agent/swarm.json` and

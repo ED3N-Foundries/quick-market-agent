@@ -22,6 +22,7 @@ export type Env = {
 
 type EnvSource = {
   TREASURY_PRIVATE_KEY?: string
+  NEAR_TREASURY_PRIVATE_KEY?: string
   AGENT_SECRET?: string
   RPC_URL?: string
   USDC_ADDRESS?: string
@@ -101,10 +102,15 @@ const envSchema = z.object({
 
 type _env = Assert<Equal<z.infer<typeof envSchema>, Env>>
 
+/** NEAR mode reads NEAR_TREASURY_PRIVATE_KEY. The Base hex line stays on TREASURY_PRIVATE_KEY. */
+export function treasuryEnvValue(chainKey: ChainKey, env: EnvSource): unknown {
+  return chainKey === "near-testnet" ? env.NEAR_TREASURY_PRIVATE_KEY : env.TREASURY_PRIVATE_KEY
+}
+
 /** Read secrets and deployment settings from the environment on each call. */
 export function loadEnv(env: EnvSource = process.env): Env {
   return envSchema.parse({
-    treasuryPrivateKey: env.TREASURY_PRIVATE_KEY,
+    treasuryPrivateKey: treasuryEnvValue(marketPreferences.chain, env),
     agentSecret: env.AGENT_SECRET,
     rpcUrl: env.RPC_URL,
     usdcAddress: env.USDC_ADDRESS,

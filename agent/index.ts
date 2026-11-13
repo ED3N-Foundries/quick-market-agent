@@ -6,13 +6,13 @@ import { privateKeyToAccount } from "viem/accounts"
 import { requireSepoliaToken } from "../shared/chain"
 import { loginMessage, nearLoginMessage } from "../shared/login"
 import { loadMarket, marketPreferences, requireExplicitChain } from "../shared/market"
-import { parseAgentSplit } from "../shared/split"
+import { agentMarketAllowed, parseAgentSplit } from "../shared/split"
 import { requireNearToken } from "../shared/near"
 import { accountFromSecret, NEP413_RECIPIENT, nep413Bytes, publicKeyBytes, seedFromSecret, sha256Bytes } from "../shared/nearKey"
 import { feeBps, windowMs } from "../server/config"
 import { configuredChain, loadEnv } from "../server/env"
 import { getDb, importLegacySwarm } from "../server/db"
-import { assertQmMetadata, fundedAgents, inspectNear, NearConfigError, readTokenMetadata } from "../server/nearInspect"
+import { assertQmMetadata, inspectNear, NearConfigError, readTokenMetadata } from "../server/nearInspect"
 import { bankAction } from "./bank"
 import { callMarket, liveBook, openMarket, recentRounds, settledRounds, type ToolReply } from "./mcp"
 import { checkConfig, swarmConfig, type TapeStats } from "./config"
@@ -123,14 +123,12 @@ async function main() {
     console.error(error instanceof Error ? error.message : error)
     process.exit(1)
   }
-  if (split.near !== 0) {
-    console.error("NEAR agent trading is not enabled. Set AGENT_SPLIT_NEAR=0.")
+  if (!agentMarketAllowed(marketPreferences.chain, split)) {
+    const name = marketPreferences.chain === "near-testnet" ? "NEAR" : "Base"
+    console.error(`${name} agent trading is off. Raise its AGENT_SPLIT share above 0.`)
     process.exit(1)
   }
-  if (marketPreferences.chain === "near-testnet") {
-    console.error("The swarm does not run on NEAR.")
-    process.exit(1)
-  }
+  console.log(`Agents trade ${marketPreferences.chain}. Split base ${split.base} / near ${split.near}.`)
   const problem = checkConfig(swarmConfig)
   if (problem) {
     console.error(problem)
@@ -145,7 +143,7 @@ async function main() {
     requireNearToken(chain.key, loadEnv().tokenAccount)
     const treasury = await accountFromSecret(loadEnv().treasuryPrivateKey)
     if (!treasury) {
-      console.error("TREASURY_PRIVATE_KEY must be an ed25519 NEAR secret key")
+      console.error("NEAR_TREASURY_PRIVATE_KEY must be an ed25519 NEAR secret key")
       process.exit(1)
     }
     try {
@@ -161,7 +159,8 @@ async function main() {
     saveNearKeyFile(nearKeys)
     const report = await inspectNear(treasury)
     for (const line of report.lines) console.error(line)
-    funded = fundedAgents(report)
+    // Buy-ins are ledger sessions. An implicit account with no on-chain NEAR can still sign and bet.
+    funded = null
   } else {
     requireSepoliaToken(chain)
   }
