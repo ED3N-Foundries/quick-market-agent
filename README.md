@@ -27,6 +27,12 @@ Copy `.env.example` to `.env`. `CHAIN` and the market preferences
 (`http://quick-market:3001` in compose). `DB_PATH` is this runner's own
 SQLite file, not the server ledger.
 
+The runner listens on `STATS_PORT` (default `3011`, `0` turns it off) and
+answers `GET /api/health` with the latest swarm snapshot: counts, phase,
+stake percentiles, money totals, and the last error. Compose does not
+publish that port. The body has no wallet keys and no addresses.
+`quick-market-health` reads it on the docker network.
+
 ## Server contract
 
 The runner is an MCP client of `API_URL` + `/mcp?chain=`. One long-lived

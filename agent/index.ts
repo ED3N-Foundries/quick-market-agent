@@ -25,6 +25,7 @@ import { openClock, stepPresence, type Arrival, type WalletClock } from "./prese
 import { replayPayouts } from "./replay"
 import { peekApiEndpoint, refreshApiEndpoint } from "./endpoint"
 import { histogram, manilaClock, parseControl, parseFlow, percentiles, type FlowFile, type SwarmSnapshot } from "./status"
+import { publishStats, startStatsServer } from "./stats"
 import { CONTROL_PATH, FLOW_PATH, KEYS_PATH, NEAR_KEYS_PATH, STATUS_PATH, SWARM_PATH, readJson, writeJsonAtomic } from "./store"
 import {
   loadWalletMap,
@@ -135,6 +136,8 @@ async function main() {
     console.error(problem)
     process.exit(1)
   }
+  const stats = startStatsServer()
+  if (stats) console.log(`agent stats on http://0.0.0.0:${stats.port}/api/health`)
   const chain = configuredChain()
   const near = marketPreferences.chain === "near-testnet"
   let funded: Set<string> | null = null
@@ -268,6 +271,7 @@ async function main() {
       windowStats,
       running,
     })
+    publishStats(snapshot)
     writeJsonAtomic(SWARM_PATH, snapshot)
     writeJsonAtomic(STATUS_PATH, snapshot)
     writeJsonAtomic(FLOW_PATH, flow)
