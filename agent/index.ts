@@ -1023,11 +1023,11 @@ async function bankPass(wallets: Map<string, LiveWallet>, flow: FlowFile, fail: 
     const response = await callMarket("withdraw", { address: wallet.address, amountMicros: action.amountMicros })
     if (response.transport) {
       noteTransport(wallets, response)
-      fail(typeof response.body.error === "string" ? response.body.error : "Withdraw failed")
+      fail(typeof response.body.error === "string" ? response.body.error : "Withdrawal failed")
       return
     }
     if (!response.ok || typeof response.body.balanceMicros !== "number") {
-      fail(typeof response.body.error === "string" ? response.body.error : "Withdraw failed")
+      fail(typeof response.body.error === "string" ? response.body.error : "Withdrawal failed")
       continue
     }
     wallet.bankroll = response.body.balanceMicros
