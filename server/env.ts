@@ -3,6 +3,7 @@ import * as z from "zod"
 import { chainFromEnv, type ChainConfig, type ChainKey } from "../shared/chain"
 import type { Assert, Equal } from "../shared/exact"
 import { marketPreferences } from "../shared/market"
+import { activeChainKey } from "./activeChain"
 import { isNearAccountId } from "../shared/near"
 import { seedFromSecret } from "../shared/nearKey"
 
@@ -63,7 +64,10 @@ export function parseTokenAccount(value: unknown): string {
   return raw
 }
 
-const treasuryKey = z.preprocess((value) => parseTreasuryKey(value), z.string().regex(/^$|^0x[0-9a-fA-F]{64}$|^ed25519:\S+$/, keyMessage))
+const treasuryKey = z.preprocess((value) => {
+  if (typeof value === "string" && (value === "" || value.startsWith("ed25519:") || /^0x[0-9a-fA-F]{64}$/.test(value))) return value
+  return parseTreasuryKey(value, activeChainKey())
+}, z.string().regex(/^$|^0x[0-9a-fA-F]{64}$|^ed25519:\S+$/, keyMessage))
 
 const tokenAccount = z.preprocess((value) => parseTokenAccount(value), z.string())
 
@@ -109,8 +113,9 @@ export function treasuryEnvValue(chainKey: ChainKey, env: EnvSource): unknown {
 
 /** Read secrets and deployment settings from the environment on each call. */
 export function loadEnv(env: EnvSource = process.env): Env {
+  const chainKey = activeChainKey()
   return envSchema.parse({
-    treasuryPrivateKey: treasuryEnvValue(marketPreferences.chain, env),
+    treasuryPrivateKey: parseTreasuryKey(treasuryEnvValue(chainKey, env), chainKey),
     agentSecret: env.AGENT_SECRET,
     rpcUrl: env.RPC_URL,
     usdcAddress: env.USDC_ADDRESS,
@@ -124,5 +129,5 @@ export function loadEnv(env: EnvSource = process.env): Env {
 }
 
 export function configuredChain(env: EnvSource = process.env): ChainConfig {
-  return chainFromEnv(marketPreferences.chain, loadEnv(env).usdcAddress)
+  return chainFromEnv(activeChainKey(), loadEnv(env).usdcAddress)
 }

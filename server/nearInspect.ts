@@ -122,18 +122,18 @@ export async function collectHoldings(treasury: string, agents: string[]): Promi
  */
 export async function inspectNear(treasury: string): Promise<TreasuryReport> {
   void activeChainKey()
-  const agents = nearAgentAccounts()
+  // Buy-ins are ledger sessions. Implicit accounts are not funded on chain,
+  // so scanning every key here only rate-limits the RPC and floods the log.
   try {
-    const read = await collectHoldings(treasury, agents)
-    const report = describeTreasury({ account: treasury, treasury: read.treasury, ledgerMicros: 0n, agents: read.agents })
-    return report
+    const read = await collectHoldings(treasury, [])
+    return describeTreasury({ account: treasury, treasury: read.treasury, ledgerMicros: 0n, agents: [] })
   } catch (error) {
     const line = error instanceof Error ? error.message : "NEAR check failed"
     const report = describeTreasury({
       account: treasury,
       treasury: { exists: false, nearYocto: 0n, tokenMicros: 0n },
       ledgerMicros: 0n,
-      agents: agents.map((account) => ({ account, holding: { exists: false, nearYocto: 0n, tokenMicros: 0n } })),
+      agents: [],
     })
     report.ok = false
     report.lines = [line, ...report.lines]

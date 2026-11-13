@@ -10,12 +10,12 @@ $1,000 is withdrawn to that wallet. Balances under $3 stay put. The runner
 does not call `claim_grant`. The first sign-in still takes the market's
 testnet grant. The swarm refuses `CHAIN=base` (real USDC).
 
-Base Sepolia and NEAR testnet each have a runner. `AGENT_SPLIT_BASE` and
-`AGENT_SPLIT_NEAR` are whole numbers that sum to 100. A share of 0 keeps
-that runner off. Each runner trades every wallet on its own chain. The NEAR
-runner reads `NEAR_TREASURY_PRIVATE_KEY` and writes `agent/keys.near.json`.
-Buy-ins are ledger sessions, so an implicit account can bet before it holds
-on-chain NEAR.
+`AGENT_SPLIT_BASE` and `AGENT_SPLIT_NEAR` are whole numbers that sum to 100.
+They divide that one crowd between Base Sepolia and NEAR testnet. A share of
+0 leaves that market idle. The same process opens one MCP session per market
+that has a share. NEAR wallets use `NEAR_TREASURY_PRIVATE_KEY` and
+`agent/keys.near.json`. Buy-ins are ledger sessions, so an implicit account
+can bet before it holds on-chain NEAR.
 
 ## Run
 
@@ -23,7 +23,6 @@ on-chain NEAR.
 bun install
 bun test
 CHAIN=base-sepolia AGENT_SPLIT_BASE=50 AGENT_SPLIT_NEAR=50 API_URL=http://127.0.0.1:3001 DB_PATH=data/quick-market-agent.sqlite bun run agent
-CHAIN=near-testnet AGENT_SPLIT_BASE=50 AGENT_SPLIT_NEAR=50 API_URL=http://127.0.0.1:3001 DB_PATH=data/quick-market-agent-near.sqlite bun run agent
 ```
 
 `bun run agents` is the terminal dashboard. It reads `agent/swarm.json` and

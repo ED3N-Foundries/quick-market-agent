@@ -10,10 +10,9 @@ COPY server ./server
 COPY <<'ENTRYEOF' /agent-entrypoint.sh
 #!/bin/sh
 set -u
-root="${AGENT_DIR:-/data}"
-mkdir -p "$root/agent"
-chown bun:bun "$root" "$root/agent"
-cd "$root"
+mkdir -p /data/agent
+chown bun:bun /data /data/agent
+cd /data
 
 stop=0
 child=0

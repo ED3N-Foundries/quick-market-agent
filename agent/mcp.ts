@@ -1,5 +1,6 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js"
+import { activeChainKey } from "../server/activeChain"
 
 export type ToolBody = Record<string, unknown>
 
@@ -27,9 +28,22 @@ export type SettledRound = {
 
 type ToolContent = { content?: { type: string; text?: string }[]; isError?: boolean }
 
-let client: Client | null = null
-let endpoint = ""
-let opening: Promise<void> | null = null
+type Session = {
+  endpoint: string
+  client: Client | null
+  opening: Promise<void> | null
+}
+
+const sessions = new Map<string, Session>()
+
+function sessionFor(chain: string): Session {
+  let row = sessions.get(chain)
+  if (!row) {
+    row = { endpoint: "", client: null, opening: null }
+    sessions.set(chain, row)
+  }
+  return row
+}
 
 export function marketUrl(apiUrl: string, chain: string): string {
   const root = apiUrl.replace(/\/api\/session\/?$/, "").replace(/\/$/, "")
@@ -101,16 +115,18 @@ export function recentRounds(body: ToolBody): { id: number; winningSide: string 
 }
 
 export async function openMarket(apiUrl: string, chain: string): Promise<void> {
-  endpoint = marketUrl(apiUrl, chain)
-  await reconnect()
+  const row = sessionFor(chain)
+  row.endpoint = marketUrl(apiUrl, chain)
+  await reconnect(row)
 }
 
 export async function callMarket(name: string, args: Record<string, unknown>): Promise<ToolReply> {
+  const row = sessionFor(activeChainKey())
   try {
-    return await once(name, args)
+    return await once(row, name, args)
   } catch (error) {
     try {
-      await reconnect()
+      await reconnect(row)
     } catch {
       // The next wave rebinds after the caller sees transport: true.
     }
@@ -122,8 +138,8 @@ export async function callMarket(name: string, args: Record<string, unknown>): P
   }
 }
 
-async function once(name: string, args: Record<string, unknown>): Promise<ToolReply> {
-  const current = await currentClient()
+async function once(row: Session, name: string, args: Record<string, unknown>): Promise<ToolReply> {
+  const current = await currentClient(row)
   const result = (await current.callTool({ name, arguments: args })) as ToolContent
   const text = result.content?.find((item) => item.type === "text")?.text
   if (!text) return { ok: false, body: { error: "The book is unreachable" }, transport: true }
@@ -139,30 +155,30 @@ async function once(name: string, args: Record<string, unknown>): Promise<ToolRe
   return { ok: result.isError !== true && !("error" in body), body: body as ToolBody, transport: false }
 }
 
-async function reconnect(): Promise<void> {
-  if (opening) return opening
-  opening = (async () => {
-    const previous = client
-    client = null
+async function reconnect(row: Session): Promise<void> {
+  if (row.opening) return row.opening
+  row.opening = (async () => {
+    const previous = row.client
+    row.client = null
     await previous?.close().catch(() => undefined)
-    client = await connect()
+    row.client = await connect(row)
   })()
   try {
-    await opening
+    await row.opening
   } finally {
-    opening = null
+    row.opening = null
   }
 }
 
-async function currentClient(): Promise<Client> {
-  if (!client) await reconnect()
-  if (!client) throw new Error("The book is unreachable")
-  return client
+async function currentClient(row: Session): Promise<Client> {
+  if (!row.client) await reconnect(row)
+  if (!row.client) throw new Error("The book is unreachable")
+  return row.client
 }
 
-async function connect(): Promise<Client> {
-  if (!endpoint) throw new Error("The book is unreachable")
+async function connect(row: Session): Promise<Client> {
+  if (!row.endpoint) throw new Error("The book is unreachable")
   const next = new Client({ name: "quick-market-agent", version: "1.0.0" })
-  await next.connect(new StreamableHTTPClientTransport(new URL(endpoint)))
+  await next.connect(new StreamableHTTPClientTransport(new URL(row.endpoint)))
   return next
 }

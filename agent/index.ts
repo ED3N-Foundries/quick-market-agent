@@ -1,12 +1,13 @@
 import * as ed from "@noble/ed25519"
 import bs58 from "bs58"
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
-import { dirname } from "node:path"
+import { dirname, join } from "node:path"
 import { privateKeyToAccount } from "viem/accounts"
 import { requireSepoliaToken } from "../shared/chain"
 import { loginMessage, nearLoginMessage } from "../shared/login"
 import { loadMarket, marketPreferences, requireExplicitChain } from "../shared/market"
-import { agentMarketAllowed, parseAgentSplit } from "../shared/split"
+import { parseAgentSplit } from "../shared/split"
+import { activeChainKey, runOnChain } from "../server/activeChain"
 import { requireNearToken } from "../shared/near"
 import { accountFromSecret, NEP413_RECIPIENT, nep413Bytes, publicKeyBytes, seedFromSecret, sha256Bytes } from "../shared/nearKey"
 import { feeBps, windowMs } from "../server/config"
@@ -123,12 +124,10 @@ async function main() {
     console.error(error instanceof Error ? error.message : error)
     process.exit(1)
   }
-  if (!agentMarketAllowed(marketPreferences.chain, split)) {
-    const name = marketPreferences.chain === "near-testnet" ? "NEAR" : "Base"
-    console.error(`${name} agent trading is off. Raise its AGENT_SPLIT share above 0.`)
-    process.exit(1)
-  }
-  console.log(`Agents trade ${marketPreferences.chain}. Split base ${split.base} / near ${split.near}.`)
+  const lanes: { chain: "base-sepolia" | "near-testnet"; share: number }[] = []
+  if (split.base > 0) lanes.push({ chain: "base-sepolia", share: split.base })
+  if (split.near > 0) lanes.push({ chain: "near-testnet", share: split.near })
+  console.log(`Agents trade ${lanes.map((lane) => lane.chain).join(" and ")}. Split base ${split.base} / near ${split.near}.`)
   const problem = checkConfig(swarmConfig)
   if (problem) {
     console.error(problem)
@@ -136,8 +135,19 @@ async function main() {
   }
   const stats = startStatsServer()
   if (stats) console.log(`agent stats on http://0.0.0.0:${stats.port}/api/health`)
+  process.on("SIGINT", () => {
+    stopRequested = true
+  })
+  process.on("SIGTERM", () => {
+    stopRequested = true
+  })
+  await Promise.all(lanes.map((lane) => runOnChain(lane.chain, () => trade(lane.share))))
+  process.exit(0)
+}
+
+async function trade(share: number): Promise<void> {
   const chain = configuredChain()
-  const near = marketPreferences.chain === "near-testnet"
+  const near = activeChainKey() === "near-testnet"
   let funded: Set<string> | null = null
   if (near) {
     requireNearToken(chain.key, loadEnv().tokenAccount)
@@ -181,19 +191,12 @@ async function main() {
   const stored = loadWalletMap(db)
   keys.forEach((key, index) => remember(wallets, key, stored.get(key.address.toLowerCase()) ?? null, index, funded))
   try {
-    await openMarket(loadEnv().apiUrl, marketPreferences.chain)
+    await openMarket(loadEnv().apiUrl, activeChainKey())
   } catch (error) {
     console.error(error instanceof Error ? error.message : error)
   }
-  await pool(
-    [...wallets.values()].filter((wallet) => wallet.enrolled),
-    swarmConfig.runner.enrollWidth,
-    async (wallet) => {
-      await bindWallet(wallets, wallet, chain.id, (message) => {
-        console.error(message)
-      })
-    },
-  )
+  // The loop signs wallets in as it seats them. Waiting here for every enrolled
+  // wallet keeps this market off the book for the whole crowd.
   const initialSteer = steering()
   const storedSpring = metaGet(db, "spring") !== null ? Number(metaGet(db, "spring")) : null
   const defaultSpring =
@@ -241,7 +244,9 @@ async function main() {
     trace = []
   }
   const recent: Arrival[] = []
-  let flow = parseFlow(readJson(FLOW_PATH))
+  const chainKey = activeChainKey()
+  const storedFlow = readJson(laneFlowPath(chainKey)) ?? (chainKey === "base-sepolia" ? readJson(FLOW_PATH) : null)
+  let flow = parseFlow(storedFlow)
   let lastError: string | null = null
   let windowStats = { roundId: null as number | null, buyIns: 0, skips: 0, up: 0, down: 0, stakes: [] as number[] }
   let lastView: DirectorView | null = null
@@ -270,20 +275,8 @@ async function main() {
       windowStats,
       running,
     })
-    publishStats(snapshot)
-    writeJsonAtomic(SWARM_PATH, snapshot)
-    writeJsonAtomic(STATUS_PATH, snapshot)
-    writeJsonAtomic(FLOW_PATH, flow)
+    publishLane(activeChainKey(), snapshot, flow)
   }
-
-  const stop = () => {
-    if (stopping) return
-    stopping = true
-    flush(false)
-    process.exit(0)
-  }
-  process.on("SIGINT", stop)
-  process.on("SIGTERM", stop)
 
   const takeBook = (): Promise<Book | null> =>
     loadBook(db, wallets, () => cursor, (value) => {
@@ -309,7 +302,7 @@ async function main() {
 
   await refreshApiEndpoint(loadEnv().apiUrl)
 
-  while (!stopping) {
+  while (!stopping && !stopRequested) {
     const now = Date.now()
     const dt = Math.max(0, (now - lastAt) / 1000)
     lastAt = now
@@ -325,14 +318,17 @@ async function main() {
       const steered = steering()
       const points = pointsOf(book?.tape ?? [], now)
       const tape = directorTape(points)
-      const view = stepDirector(director, {
-        now,
-        dtSec: dt,
-        tape,
-        config: swarmConfig.clock,
-        pin: steered.pin,
-        hold: steered.hold,
-      })
+      const view = scaleCrowd(
+        stepDirector(director, {
+          now,
+          dtSec: dt,
+          tape,
+          config: swarmConfig.clock,
+          pin: steered.pin,
+          hold: steered.hold,
+        }),
+        share,
+      )
       lastView = view
       const room = Math.max(0, Math.floor(swarmConfig.clock.perSecond * Math.max(dt, 0)))
       const wanted = Math.min(
@@ -340,7 +336,7 @@ async function main() {
         Math.max(Math.ceil(view.window[1]) + 15, Math.ceil(view.window[1] * 1.4)),
       )
       if (keys.length < wanted && room > 0) {
-        if (marketPreferences.chain === "near-testnet") {
+        if (activeChainKey() === "near-testnet") {
           const next = await growNearKeys(
             keys.map((key) => ({ account: key.address, privateKey: key.privateKey })),
             Math.min(wanted, keys.length + room),
@@ -642,6 +638,7 @@ async function main() {
     const wait = Math.min(swarmConfig.runner.snapshotEveryMs, Math.max(40, remain))
     await sleep(wait)
   }
+  flush(false)
 }
 
 function steering(): { pin: number | null; hold: "off-peak" | "peak" | null; control: ReturnType<typeof parseControl> } {
@@ -828,7 +825,7 @@ async function signLogin(
   chainId: number,
   issued: number,
 ): Promise<{ signature: string; nonce?: string; publicKey?: string } | null> {
-  if (marketPreferences.chain === "near-testnet") {
+  if (activeChainKey() === "near-testnet") {
     const nonce = crypto.getRandomValues(new Uint8Array(32))
     const seed = seedFromSecret(wallet.privateKey)
     const pub = await publicKeyBytes(wallet.privateKey)
@@ -1208,6 +1205,105 @@ async function pool<T>(items: T[], width: number, job: (item: T) => Promise<void
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+let stopRequested = false
+
+const lanePublish = new Map<string, { snapshot: SwarmSnapshot; flow: FlowFile }>()
+
+/** One crowd, divided by the split. A share of 100 leaves the clock unchanged. */
+export function scaleCrowd(view: DirectorView, share: number): DirectorView {
+  const factor = share / 100
+  if (factor === 1) return view
+  return {
+    ...view,
+    center: view.center * factor,
+    target: view.target * factor,
+    online: view.online * factor,
+    window: [view.window[0] * factor, view.window[1] * factor] as [number, number],
+  }
+}
+
+function laneFlowPath(chain: string): string {
+  return join(dirname(FLOW_PATH), `flow.${chain}.json`)
+}
+
+function publishLane(chain: string, snapshot: SwarmSnapshot, flow: FlowFile) {
+  lanePublish.set(chain, { snapshot, flow })
+  writeJsonAtomic(laneFlowPath(chain), flow)
+  const rows = [...lanePublish.values()]
+  const merged = rows.length === 1 ? rows[0]!.snapshot : mergeLanes(rows.map((row) => row.snapshot))
+  const flowSum = rows.reduce(
+    (sum, row) => ({
+      seedMicros: sum.seedMicros + row.flow.seedMicros,
+      mintMicros: sum.mintMicros + row.flow.mintMicros,
+      burnMicros: sum.burnMicros + row.flow.burnMicros,
+      stakeMicros: sum.stakeMicros + row.flow.stakeMicros,
+    }),
+    { seedMicros: 0, mintMicros: 0, burnMicros: 0, stakeMicros: 0 },
+  )
+  publishStats(merged)
+  writeJsonAtomic(SWARM_PATH, merged)
+  writeJsonAtomic(STATUS_PATH, merged)
+  writeJsonAtomic(FLOW_PATH, flowSum)
+}
+
+/** Heads and stakes add. The spring is the shared clock, so it stays the max, not a sum. */
+export function mergeLanes(rows: SwarmSnapshot[]): SwarmSnapshot {
+  const newest = rows.reduce((best, row) => (row.at >= best.at ? row : best))
+  const book = rows.reduce((best, row) => (row.book.buyIns >= best.book.buyIns ? row : best)).book
+  const bands = new Map<string, number>()
+  for (const row of rows) {
+    for (const band of row.money.histogram) bands.set(band.band, (bands.get(band.band) ?? 0) + band.count)
+  }
+  const errors = rows.map((row) => row.lastError).filter((item): item is string => Boolean(item))
+  const lags = rows.map((row) => row.bookLagMs).filter((item): item is number => typeof item === "number")
+  return {
+    ...newest,
+    at: newest.at,
+    window: [
+      rows.reduce((sum, row) => sum + row.window[0], 0),
+      rows.reduce((sum, row) => sum + row.window[1], 0),
+    ],
+    online: rows.reduce((sum, row) => sum + row.online, 0),
+    enrolled: rows.reduce((sum, row) => sum + (row.enrolled ?? 0), 0),
+    arrivedMinute: rows.reduce((sum, row) => sum + row.arrivedMinute, 0),
+    leftMinute: rows.reduce((sum, row) => sum + row.leftMinute, 0),
+    target: rows.reduce((sum, row) => sum + row.target, 0),
+    spring: Math.max(...rows.map((row) => row.spring)),
+    trace: sumTraces(rows),
+    running: rows.some((row) => row.running !== false),
+    lastError: errors.length > 0 ? errors.join(" · ") : null,
+    bookLagMs: lags.length > 0 ? Math.max(...lags) : null,
+    book: {
+      ...book,
+      botUpMicros: rows.reduce((sum, row) => sum + row.book.botUpMicros, 0),
+      botDownMicros: rows.reduce((sum, row) => sum + row.book.botDownMicros, 0),
+      buyIns: rows.reduce((sum, row) => sum + row.book.buyIns, 0),
+      skips: rows.reduce((sum, row) => sum + row.book.skips, 0),
+    },
+    money: {
+      seedMicros: rows.reduce((sum, row) => sum + row.money.seedMicros, 0),
+      mintMicros: rows.reduce((sum, row) => sum + row.money.mintMicros, 0),
+      burnMicros: rows.reduce((sum, row) => sum + row.money.burnMicros, 0),
+      stakeMicros: rows.reduce((sum, row) => sum + row.money.stakeMicros, 0),
+      histogram: [...bands.entries()].map(([band, count]) => ({ band, count })),
+    },
+  }
+}
+
+function sumTraces(rows: SwarmSnapshot[]): number[] {
+  const length = Math.max(...rows.map((row) => row.trace.length))
+  const out: number[] = []
+  for (let i = 0; i < length; i++) {
+    let sum = 0
+    for (const row of rows) {
+      const value = row.trace[row.trace.length - length + i]
+      if (typeof value === "number") sum += value
+    }
+    out.push(sum)
+  }
+  return out.slice(-180)
 }
 
 if (import.meta.main) await main()
