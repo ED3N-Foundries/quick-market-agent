@@ -71,5 +71,5 @@ through the public MCP server.
 
 Edit `agent/config.ts`. That file is the schedule, the minds, the stake
 shape, and the runner batch sizes. `agent/control.json` only steers a
-running swarm: follow the clock, hold off-peak, hold peak, pin a count,
+running swarm: follow the clock, hold off-peak, hold peak, ramp to the peak, pin a count,
 pause buy-ins, or freeze mints and burns.

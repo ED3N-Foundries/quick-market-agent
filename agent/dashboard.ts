@@ -4,6 +4,7 @@ import { Database } from "bun:sqlite"
 import { marketPreferences } from "../shared/market"
 import { parseAgentSplit } from "../shared/split"
 import { loadEnv } from "../server/env"
+import { swarmConfig } from "./config"
 import { peekApiEndpoint, refreshApiEndpoint, type ApiTarget } from "./endpoint"
 import { CONTROL_PATH, STATUS_PATH, SWARM_PATH, readJson, writeJsonAtomic } from "./store"
 import { roster, rosterCount, type RosterFilter, type WalletRow } from "./swarmdb"
@@ -20,7 +21,7 @@ import {
 const FILTERS: readonly RosterFilter[] = ["all", "stuck", "richest"]
 
 export const HELP_LINES = [
-  "c clock   o off-peak   e peak   [ ] pin ±1   - = pin ±10",
+  "c clock   o off-peak   e peak   a ramp   [ ] pin ±1   - = pin ±10",
   "b buy-ins   m bleed   p wallet   P clear   j/k move   f filter   s start   R restart   q quit",
 ] as const
 
@@ -78,13 +79,17 @@ export function handleKey(
     control.mode = "peak"
     control.pin = null
   }
+  if (key === "a") {
+    control.mode = "ramp"
+    control.pin = null
+  }
   if (key === "[") {
     control.mode = "pin"
     control.pin = Math.max(1, (control.pin ?? 30) - 1)
   }
   if (key === "]") {
     control.mode = "pin"
-    control.pin = Math.min(6_000, (control.pin ?? 30) + 1)
+    control.pin = Math.min(swarmConfig.clock.ceiling, (control.pin ?? 30) + 1)
   }
   if (key === "-" || key === "_") {
     control.mode = "pin"
@@ -92,7 +97,7 @@ export function handleKey(
   }
   if (key === "=" || key === "+") {
     control.mode = "pin"
-    control.pin = Math.min(6_000, (control.pin ?? 30) + 10)
+    control.pin = Math.min(swarmConfig.clock.ceiling, (control.pin ?? 30) + 10)
   }
   if (key === "b") control.buyInPaused = !control.buyInPaused
   if (key === "m") control.bleed = !control.bleed
@@ -468,7 +473,7 @@ export async function runRunnerIntent(intent: "spawn" | "respawn", pid: number |
 function controlFromSnapshot(snapshot: SwarmSnapshot): ControlFile {
   return {
     mode:
-      snapshot.mode === "pin" || snapshot.mode === "off-peak" || snapshot.mode === "peak" || snapshot.mode === "clock"
+      snapshot.mode === "pin" || snapshot.mode === "off-peak" || snapshot.mode === "peak" || snapshot.mode === "ramp" || snapshot.mode === "clock"
         ? snapshot.mode
         : "clock",
     pin: snapshot.pin,

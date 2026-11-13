@@ -21,6 +21,7 @@ export type ClockConfig = {
   rise: { fromHour: number; toHour: number; fromCenter: number; toCenter: number }
   peak: { fromHour: number; toHour: number; box: Range }
   decline: { fromHour: number; toHour: number; toCenter: number }
+  ramp: { smoothTime: number; perSecond: number }
   noise: {
     slow: number
     fast: number
@@ -133,6 +134,9 @@ export type RunnerConfig = {
   tapeTailMs: number
   presenceTickMs: number
   keyCap: number
+  enrollGapMs: number
+  rampEnrollWidth: number
+  rampEnrollGapMs: number
 }
 
 export type TimingConfig = {
@@ -186,6 +190,7 @@ const clockSchema = z.strictObject({
   }),
   peak: z.strictObject({ fromHour: z.number(), toHour: z.number(), box: range }),
   decline: z.strictObject({ fromHour: z.number(), toHour: z.number(), toCenter: z.number() }),
+  ramp: z.strictObject({ smoothTime: z.number(), perSecond: z.number() }),
   noise: z.strictObject({
     slow: z.number(),
     fast: z.number(),
@@ -302,6 +307,9 @@ const runnerSchema = z.strictObject({
   tapeTailMs: z.number(),
   presenceTickMs: z.number(),
   keyCap: z.number(),
+  enrollGapMs: z.number(),
+  rampEnrollWidth: z.number(),
+  rampEnrollGapMs: z.number(),
 })
 
 const timingSchema = z.strictObject({
@@ -342,15 +350,16 @@ type _swarm = Assert<Equal<z.infer<typeof swarmSchema>, SwarmConfig>>
 const swarmInput: SwarmConfig = {
   clock: {
     timeZoneOffsetHours: 8,
-    windowWidth: 300,
-    floor: 300,
-    ceiling: 6_000,
+    windowWidth: 600,
+    floor: 600,
+    ceiling: 12_000,
     smoothTime: 180,
     perSecond: 30,
-    offPeak: { fromHour: 2, toHour: 7, box: [300, 600] },
-    rise: { fromHour: 7, toHour: 17, fromCenter: 450, toCenter: 3_150 },
-    peak: { fromHour: 17, toHour: 23, box: [3_000, 6_000] },
-    decline: { fromHour: 23, toHour: 2, toCenter: 450 },
+    offPeak: { fromHour: 2, toHour: 7, box: [600, 1_200] },
+    rise: { fromHour: 7, toHour: 17, fromCenter: 900, toCenter: 6_300 },
+    peak: { fromHour: 17, toHour: 23, box: [6_000, 12_000] },
+    decline: { fromHour: 23, toHour: 2, toCenter: 900 },
+    ramp: { smoothTime: 24, perSecond: 80 },
     noise: {
       slow: 0.72,
       fast: 0.2,
@@ -446,7 +455,7 @@ const swarmInput: SwarmConfig = {
     restlessMax: 8,
   },
   runner: {
-    enrollWidth: 16,
+    enrollWidth: 32,
     betChunk: 200,
     orderCap: 800,
     auditSlice: 200,
@@ -455,7 +464,10 @@ const swarmInput: SwarmConfig = {
     snapshotEveryMs: 250,
     tapeTailMs: 90_000,
     presenceTickMs: 1_000,
-    keyCap: 6_000,
+    keyCap: 12_000,
+    enrollGapMs: 1_000,
+    rampEnrollWidth: 4,
+    rampEnrollGapMs: 8_000,
   },
   timing: {
     historyWindows: 4,
@@ -546,6 +558,11 @@ export function checkConfig(config: SwarmConfig): string | null {
   if (!(config.persona.flatBand < config.persona.movingBand)) return "Flat gate sits above the moving gate"
   if (config.bank.floorMicros >= config.bank.capMicros) return "Bank floor sits on the cap"
   if (config.runner.keyCap !== clock.ceiling) return "Key cap and the crowd ceiling differ"
+  if (!(clock.ramp.smoothTime > 0 && clock.ramp.smoothTime <= clock.smoothTime)) return "Ramp smooth time is outside the glide"
+  if (!(clock.ramp.perSecond >= clock.perSecond)) return "Ramp pace sits under the glide"
+  if (!(config.runner.enrollGapMs > 0)) return "Enroll gap must be positive"
+  if (!(config.runner.rampEnrollWidth >= 1)) return "Ramp enroll width must be positive"
+  if (!(config.runner.rampEnrollGapMs > 0)) return "Ramp enroll gap must be positive"
 
   const { timing } = config
   if (timing.historyWindows < 1) return "History needs a window"

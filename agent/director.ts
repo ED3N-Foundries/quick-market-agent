@@ -11,7 +11,9 @@ export type DirectorState = {
   velocity: number
 }
 
-export type CrowdPhase = "off-peak" | "rise" | "peak" | "decline" | "pin"
+export type CrowdPhase = "off-peak" | "rise" | "peak" | "decline" | "pin" | "ramp"
+
+export type CrowdPace = "glide" | "ramp"
 
 export type DirectorView = {
   state: DirectorState
@@ -21,6 +23,7 @@ export type DirectorView = {
   window: readonly [number, number]
   target: number
   online: number
+  perSecond: number
 }
 
 export function createDirector(value: number): DirectorState {
@@ -102,6 +105,13 @@ export function scheduleAt(now: number, tape: TapeStats, config: ClockConfig): S
   return { phase: "decline", hour, center, window: [low, Math.max(low, high)] }
 }
 
+function asPeak(now: number, tape: TapeStats, config: ClockConfig): SchedulePoint {
+  const held = scheduleAt(now, tape, config)
+  const hour = config.peak.fromHour + (config.peak.toHour - config.peak.fromHour) / 2
+  const shifted = now + (hour - held.hour) * 3_600_000
+  return scheduleAt(shifted, tape, config)
+}
+
 export function stepDirector(
   state: DirectorState,
   input: {
@@ -111,39 +121,41 @@ export function stepDirector(
     config: ClockConfig
     pin: number | null
     hold: "off-peak" | "peak" | null
+    pace?: CrowdPace
   },
 ): DirectorView {
+  const pinned = input.pin !== null && Number.isFinite(input.pin)
+  const ramping = (input.pace ?? "glide") === "ramp" && !pinned
   let point = scheduleAt(input.now, input.tape, input.config)
-  if (input.hold === "off-peak") {
+  if (ramping || input.hold === "peak") {
+    point = asPeak(input.now, input.tape, input.config)
+  } else if (input.hold === "off-peak") {
     const box = input.config.offPeak.box
     point = { phase: "off-peak", hour: point.hour, center: (box[0] + box[1]) / 2, window: [box[0], box[1]] }
-  } else if (input.hold === "peak") {
-    const held = scheduleAt(input.now, input.tape, input.config)
-    const hour = input.config.peak.fromHour + (input.config.peak.toHour - input.config.peak.fromHour) / 2
-    const shifted = input.now + (hour - held.hour) * 3_600_000
-    point = scheduleAt(shifted, input.tape, input.config)
   }
 
   let center = point.center
   let window = point.window
-  let phase: CrowdPhase = point.phase
+  let phase: CrowdPhase = ramping ? "ramp" : point.phase
   let target = center
-  if (input.pin !== null && Number.isFinite(input.pin)) {
-    target = clamp(input.pin, 1, input.config.ceiling)
+  if (pinned) {
+    target = clamp(input.pin as number, 1, input.config.ceiling)
     center = target
     window = [target, target]
     phase = "pin"
   }
 
+  const smoothTime = ramping ? input.config.ramp.smoothTime : input.config.smoothTime
+  const perSecond = ramping ? input.config.ramp.perSecond : input.config.perSecond
   const springState = { value: state.value, velocity: state.velocity }
   if (input.dtSec > 0) {
     const before = springState.value
-    spring.damp(springState, target, input.config.smoothTime, input.dtSec)
-    const cap = input.config.perSecond * input.dtSec
+    spring.damp(springState, target, smoothTime, input.dtSec)
+    const cap = perSecond * input.dtSec
     const delta = springState.value - before
     if (Math.abs(delta) > cap) {
       springState.value = before + Math.sign(delta) * cap
-      springState.velocity = Math.sign(delta) * input.config.perSecond
+      springState.velocity = Math.sign(delta) * perSecond
     }
     if ((before <= target && springState.value >= target) || (before >= target && springState.value <= target)) {
       springState.value = target
@@ -154,5 +166,5 @@ export function stepDirector(
   state.velocity = springState.velocity
   const low = input.pin === null ? input.config.floor : 1
   const online = clamp(Math.round(springState.value), low, input.config.ceiling)
-  return { state, phase, hour: point.hour, center, window, target, online }
+  return { state, phase, hour: point.hour, center, window, target, online, perSecond }
 }

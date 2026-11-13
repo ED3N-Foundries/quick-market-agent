@@ -17,7 +17,7 @@ import { assertQmMetadata, inspectNear, NearConfigError, readTokenMetadata } fro
 import { bankAction } from "./bank"
 import { callMarket, liveBook, openMarket, recentRounds, settledRounds, type ToolReply } from "./mcp"
 import { checkConfig, swarmConfig, type TapeStats } from "./config"
-import { admitWallet, decideOpen, freshGate, noteResult, tapeActivity, type GateState, type PrintPoint, type Side } from "./decide"
+import { admitWallet, decideOpen, freshGate, keptReadyWindow, noteResult, tapeActivity, type GateState, type PrintPoint, type Side } from "./decide"
 import { fireAt, releaseWave, type FireSlot } from "./schedule"
 import { createDirector, manilaHour, stepDirector, type DirectorState, type DirectorView } from "./director"
 import { growKeys, growNearKeys, type NearStoredKey, type StoredKey } from "./keys"
@@ -208,6 +208,7 @@ async function trade(share: number): Promise<void> {
       config: swarmConfig.clock,
       pin: initialSteer.pin,
       hold: initialSteer.hold,
+      pace: initialSteer.pace,
     }).target
   const initialSpring =
     storedSpring !== null && Number.isFinite(storedSpring)
@@ -232,6 +233,7 @@ async function trade(share: number): Promise<void> {
   let auditCursor = 0
   let bankAt = 0
   let enrolling = false
+  let nextEnrollBatch = 0
   let banking = false
   let minute = Math.floor(Date.now() / 60_000)
   let arrivedMinute = 0
@@ -326,11 +328,12 @@ async function trade(share: number): Promise<void> {
           config: swarmConfig.clock,
           pin: steered.pin,
           hold: steered.hold,
+          pace: steered.pace,
         }),
         share,
       )
       lastView = view
-      const room = Math.max(0, Math.floor(swarmConfig.clock.perSecond * Math.max(dt, 0)))
+      const room = Math.max(0, Math.floor(view.perSecond * Math.max(dt, 0)))
       const wanted = Math.min(
         swarmConfig.runner.keyCap,
         Math.max(Math.ceil(view.window[1]) + 15, Math.ceil(view.window[1] * 1.4)),
@@ -379,7 +382,7 @@ async function trade(share: number): Promise<void> {
         tape: bend,
         recentArrivals: recent,
         config: swarmConfig.presence,
-        perSecond: swarmConfig.clock.perSecond,
+        perSecond: view.perSecond,
       })
       const byAddress = new Map(step.clocks.map((clock) => [clock.address, clock]))
       for (const wallet of enrolledWallets) {
@@ -420,9 +423,17 @@ async function trade(share: number): Promise<void> {
 
       flush()
       const needsSignIn = [...wallets.values()].some((wallet) => wallet.enrolled && !wallet.bound && wallet.nextEnroll <= now)
-      if (!enrolling && (needsSignIn || enrolledWallets.length < Math.min(swarmConfig.runner.keyCap, Math.ceil(view.online)))) {
+      const near = activeChainKey() === "near-testnet"
+      const enrollGap = near ? swarmConfig.runner.rampEnrollGapMs : swarmConfig.runner.enrollGapMs
+      if (
+        !enrolling &&
+        now >= nextEnrollBatch &&
+        (needsSignIn || enrolledWallets.length < Math.min(swarmConfig.runner.keyCap, Math.ceil(view.online)))
+      ) {
         enrolling = true
-        void enrollDue(wallets, chain.id, now, Math.ceil(view.online), flow, (message) => {
+        nextEnrollBatch = now + enrollGap
+        const enrollWidth = near ? swarmConfig.runner.rampEnrollWidth : swarmConfig.runner.enrollWidth
+        void enrollDue(wallets, chain.id, now, Math.ceil(view.online), enrollWidth, flow, (message) => {
           lastError = message
         }).finally(() => {
           enrolling = false
@@ -641,14 +652,20 @@ async function trade(share: number): Promise<void> {
   flush(false)
 }
 
-function steering(): { pin: number | null; hold: "off-peak" | "peak" | null; control: ReturnType<typeof parseControl> } {
+function steering(): {
+  pin: number | null
+  hold: "off-peak" | "peak" | null
+  pace: "glide" | "ramp"
+  control: ReturnType<typeof parseControl>
+} {
   const control = parseControl(readJson(CONTROL_PATH))
   const pin = loadEnv().swarmPin
-  if (pin !== null) return { pin: Math.max(1, Math.round(pin)), hold: null, control }
-  if (control.mode === "pin") return { pin: control.pin ?? 1, hold: null, control }
-  if (control.mode === "off-peak") return { pin: null, hold: "off-peak", control }
-  if (control.mode === "peak") return { pin: null, hold: "peak", control }
-  return { pin: null, hold: null, control }
+  if (pin !== null) return { pin: Math.max(1, Math.round(pin)), hold: null, pace: "glide", control }
+  if (control.mode === "pin") return { pin: control.pin ?? 1, hold: null, pace: "glide", control }
+  if (control.mode === "off-peak") return { pin: null, hold: "off-peak", pace: "glide", control }
+  if (control.mode === "peak") return { pin: null, hold: "peak", pace: "glide", control }
+  if (control.mode === "ramp") return { pin: null, hold: null, pace: "ramp", control }
+  return { pin: null, hold: null, pace: "glide", control }
 }
 
 function remember(
@@ -701,7 +718,7 @@ function gateFrom(json: string, index: number, persona: Persona): GateState {
     const parsed = JSON.parse(json) as Partial<GateState>
     if (typeof parsed.rngA !== "number" || typeof parsed.readyWindow !== "number") return fresh
     return {
-      readyWindow: parsed.readyWindow < nowWindow - 20 ? nowWindow + stagger : parsed.readyWindow,
+      readyWindow: keptReadyWindow(parsed.readyWindow, nowWindow, stagger),
       burstLeft: typeof parsed.burstLeft === "number" ? parsed.burstLeft : 0,
       refractory: parsed.refractory === true,
       results: Array.isArray(parsed.results) ? parsed.results.filter((item): item is boolean => typeof item === "boolean").slice(-32) : [],
@@ -749,6 +766,7 @@ async function enrollDue(
   chainId: number,
   now: number,
   wantedOnline: number,
+  enrollWidth: number,
   _flow: FlowFile,
   fail: (message: string) => void,
 ) {
@@ -761,10 +779,10 @@ async function enrollDue(
       : [...wallets.values()]
           .filter((wallet) => !wallet.enrolled && wallet.nextEnroll <= now)
           .sort((left, right) => left.index - right.index)
-          .slice(0, Math.min(needed, swarmConfig.runner.enrollWidth))
-  const due = repair.length > swarmConfig.runner.enrollWidth ? repair : [...repair, ...fresh].slice(0, swarmConfig.runner.enrollWidth)
+          .slice(0, Math.min(needed, enrollWidth))
+  const due = [...repair, ...fresh].slice(0, enrollWidth)
   if (due.length === 0) return
-  await pool(due, swarmConfig.runner.enrollWidth, async (wallet) => {
+  await pool(due, enrollWidth, async (wallet) => {
     await bindWallet(wallets, wallet, chainId, fail)
   })
 }

@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test"
 import { USDC, swarmConfig } from "./config"
-import { decideOpen, decideWallet, decideWindow, drawdownScale, exhaustStake, freshGate, type PrintPoint, type Side, type WalletMind } from "./decide"
+import { decideOpen, decideWallet, decideWindow, drawdownScale, exhaustStake, freshGate, keptReadyWindow, type PrintPoint, type Side, type WalletMind } from "./decide"
 import { personaFor, type Persona } from "./persona"
 
 const persona = swarmConfig.persona
@@ -306,6 +306,15 @@ test("a wallet under 1 USDC skips", () => {
     timing,
   })
   expect(decision.action).toBe("skip")
+})
+
+test("a ready window from the old 5-second clock is pulled back onto this clock", () => {
+  const nowWindow = 179_458_361
+  const stagger = 4
+  expect(keptReadyWindow(nowWindow + 12, nowWindow, stagger)).toBe(nowWindow + 12)
+  expect(keptReadyWindow(nowWindow - 20, nowWindow, stagger)).toBe(nowWindow - 20)
+  expect(keptReadyWindow(nowWindow - 21, nowWindow, stagger)).toBe(nowWindow + stagger)
+  expect(keptReadyWindow(358_615_801, nowWindow, stagger)).toBe(nowWindow + stagger)
 })
 
 function streakMind(need: 2 | 3 | 4 | 5, fade: boolean): WalletMind {

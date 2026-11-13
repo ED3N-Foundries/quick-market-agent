@@ -25,22 +25,24 @@ No wallet is told the next print. No wallet calls a model. The rules read the pu
 
 ## How many are online
 
-The live crowd always prefers a window about 300 agents wide. That window slides. It does not jump.
+The live crowd always prefers a window about 600 agents wide. That window slides. It does not jump.
 
 Asia/Manila (UTC+8, no daylight saving) is the clock. Hours below are Manila local.
 
 | Hours | Preference window |
 | --- | --- |
-| 02:00–07:00 | Fixed at [300, 600]. This is the off-peak example. |
-| 07:00–17:00 | Center eases from 450 toward the low end of the peak box (~3,150) with `easing.cubicInOut`. The window is `[center - 150, center + 150]`. |
-| 17:00–23:00 | A 300-wide window whose center wanders inside [3000, 6000]. An evening might sit near 3,400, then near 5,200. It does not occupy that whole span at once. |
-| 23:00–02:00 | Center eases back to 450. |
+| 02:00–07:00 | Fixed at [600, 1,200]. This is the off-peak example. |
+| 07:00–17:00 | Center eases from 900 toward the low end of the peak box (~6,300) with `easing.cubicInOut`. The window is `[center - 300, center + 300]`. |
+| 17:00–23:00 | A 600-wide window whose center wanders inside [6000, 12000]. An evening might sit near 6,800, then near 10,400. It does not occupy that whole span at once. |
+| 23:00–02:00 | Center eases back to 900. |
 
-The window is clamped so it never asks for fewer than 300 or more than 6,000. While the legal box is only 300 wide, the window is that box. While the box is wider, the center walks inside it and the window stays 300 wide.
+The window is clamped so it never asks for fewer than 600 or more than 12,000. While the legal box is only 600 wide, the window is that box. While the box is wider, the center walks inside it and the window stays 600 wide.
 
 The integer online count chases the window center with `spring.damp` (`smoothTime` about 180 seconds). It may trail the window by a few minutes. Presence changes are capped at 30 wallets a second, so a dashboard override still glides instead of signing in thousands at once.
 
-Keys are an identity pool, not the live count. `agent/keys.json` only grows, up to 6,000, mode 0600. Dropping to off-peak sleeps wallets. It does not delete keys. The first wallets already in the file stay themselves.
+Ramp mode aims at the peak window immediately. Its spring uses `ramp.smoothTime` (24 seconds) and `ramp.perSecond` (80). A pin still uses the 30-per-second glide. Sign-in batches are always sliced to a width, including the startup rebind of wallets that lost their session. Base uses `enrollWidth` (32) and then waits `enrollGapMs` (1 second). NEAR uses `rampEnrollWidth` (4) and `rampEnrollGapMs` (8 seconds) in every mode. A NEAR sign-in of a wallet that has never been granted opens a mint, and a wide batch pegs the market. The field names come from the ramp. The limit follows the chain.
+
+Keys are an identity pool, not the live count. `agent/keys.json` only grows, up to 12,000, mode 0600. Dropping to off-peak sleeps wallets. It does not delete keys. The first wallets already in the file stay themselves.
 
 `SWARM_PIN` (or the dashboard pin) replaces the clock with a fixed target for a small local run. Unset, `bun run agent` follows Manila time. The swarm refuses `CHAIN=base`. Real USDC is out of this mode.
 
@@ -52,19 +54,19 @@ The file exports one typed object, `swarmConfig`, in groups that match the layer
 
 | Group | What you edit |
 | --- | --- |
-| `clock` | Timezone, Manila phases, window width, floor, ceiling, spring smooth time, presence cap per second, and how the spare-room noise budget splits across slow wander, fast octave, and tape interest. |
+| `clock` | Timezone, Manila phases, window width, floor, ceiling, spring smooth time, presence cap per second, the ramp pace, and how the spare-room noise budget splits across slow wander, fast octave, and tape interest. |
 | `presence` | Chronotype offset, hysteresis, visit and gap ranges, how far the tape may stretch or cut a visit, and the arrival bump. |
 | `bank` | Floor, cap, seed range, refill pocket, burn pocket. |
 | `persona` | Mind shares, second-mind rate, lookbacks, edge, Kelly fraction, bankroll share, noise scale, tempo, burst, refractory gap, moving and flat gate bands, herd cap, and the memory length and step. |
 | `stake` | Cent bands and the round-dollar offset. |
-| `runner` | Enroll width, bet chunk size, order cap, audit slice, bank pass, snapshot interval, and tape-tail length. |
+| `runner` | Enroll width, ramp enroll width, bet chunk size, order cap, audit slice, bank pass, snapshot interval, and tape-tail length. |
 | `timing` | How many past windows feed the price signal, the EWMA and thin-history edge, the streak lean and middle fire slot, virtual pool, wave size, and the loss-streak floor. |
 
 `agent/index.ts` imports that object once and passes each slice in. `director`, `presence`, `bank`, `persona`, `decide`, and `stake` take the slice as an argument. A test uses the shipped object or a smaller one. Changing a knob is an edit to `agent/config.ts` and a restart of the runner.
 
 `checkConfig` runs before the first enroll. Mind shares sum to 1. Every range has its low end first. Each phase window fits inside its legal box. The noise weights fit inside the spare room. Gate bands sit inside 0–1. A failed check stops the process before any wallet signs in.
 
-`agent/control.json` stays the live steering file: follow the clock, hold a phase, pin a count, pause betting, bleed on or off. It does not repeat the schedule, the minds, or the bank band. Secrets and `SWARM_PIN` stay in the environment. Market rules that already live in `server/config.ts` (minimum stake, window length, the human grant) are not copied here. The agent reads those from the book.
+`agent/control.json` stays the live steering file: follow the clock, hold a phase, ramp to the peak, pin a count, pause betting, bleed on or off. It does not repeat the schedule, the minds, or the bank band. Secrets and `SWARM_PIN` stay in the environment. Market rules that already live in `server/config.ts` (minimum stake, window length, the human grant) are not copied here. The agent reads those from the book.
 
 ## Layers
 
@@ -74,7 +76,7 @@ Each layer is a pure function with tests, except the last two, which do I/O. The
 
 `agent/director.ts`
 
-Inputs are `now` and the `clock` slice. Output is the envelope, the 300-wide window, and the spring target.
+Inputs are `now` and the `clock` slice. Output is the envelope, the 600-wide window, and the spring target.
 
 Use `math` (pmndrs, pin `0.1.0`):
 
@@ -84,9 +86,9 @@ Use `math` (pmndrs, pin `0.1.0`):
 - `spring.damp` for the online count. One scalar spring, updated with the real delta, not a new spring each tick.
 - `mulberry32` only where a decision must be reproducible from a seed.
 
-Noise amplitude is half the spare room inside the current box, so the wander cannot leave [3000, 6000] during peak or leave [300, 600] off-peak.
+Noise amplitude is half the spare room inside the current box, so the wander cannot leave [6000, 12000] during peak or leave [600, 1200] off-peak.
 
-That budget is split across three terms. Most of it is the slow evening wander (`fbm` on `simplex2d`). A faster octave, another `simplex2d` sample with time scaled up, roughens the trace so the count is not a single glass curve. A thin slice is interest: positive when recent absolute return is large versus recent volatility, negative when the tape has been flat. Interest only spends spare room. Off-peak the spare room is already tight, so a hot tape at 03:00 stays inside [300, 600].
+That budget is split across three terms. Most of it is the slow evening wander (`fbm` on `simplex2d`). A faster octave, another `simplex2d` sample with time scaled up, roughens the trace so the count is not a single glass curve. A thin slice is interest: positive when recent absolute return is large versus recent volatility, negative when the tape has been flat. Interest only spends spare room. Off-peak the spare room is already tight, so a hot tape at 03:00 stays inside [600, 1,200].
 
 ### 2. Who is awake
 
@@ -102,7 +104,7 @@ Each wallet also runs an alternating renewal clock, seeded once:
 
 Session rates are calibrated so the expected number of open visits tracks the spring target across the day. The clock is who wants a chair. The spring is how many chairs exist.
 
-- Under the target: wake wallets whose visit has started, soonest-due first, inside the 30-per-second budget. If that is not enough, wake wallets whose gap is about to end. Do not pull wallets that are deep in an off-hours gap.
+- Under the target: wake wallets whose visit has started, soonest-due first, inside the pace cap (30 a second on the clock, 80 while ramping). If that is not enough, wake wallets whose gap is about to end. Do not pull wallets that are deep in an off-hours gap.
 - Over the target: end visits, least sticky first. A visit that already ended is first out. A wallet in the first moments of a visit yields before one that has been seated. Sticky means a visit that still fits the chronotype.
 - Hysteresis: once seated, a wallet keeps the chair through small target jitter, about 40 places on the spare list. It still leaves when its visit ends and someone else is due. The same address does not flap every window.
 
@@ -115,7 +117,7 @@ The tape may bend a visit. It may not delete the clock or the chair count.
 
 Paused addresses and a global betting pause do not change presence. They only stop bets. Sleeping wallets do not sign in, bet, or receive money.
 
-New keys are created only as the high-water mark rises, and only inside the 30-per-second budget.
+New keys are created only as the high-water mark rises, and only inside the same pace cap.
 
 ### 3. Bankroll and bleed
 
@@ -242,7 +244,7 @@ One screen, sized to the terminal:
 
 Controls, written to `agent/control.json`:
 
-- follow the clock, hold off-peak, hold peak, or pin a count
+- follow the clock, hold off-peak, hold peak, ramp to the peak, or pin a count
 - pause or resume betting for the swarm, and for one address
 - bleed on or off
 - `q` closes the dashboard and leaves the runner up
@@ -277,7 +279,7 @@ Indexes already exist on `bets(round_id)` and `bets(address)`. Batch inserts use
 ## Tests
 
 - Config: the shipped object passes `checkConfig`. A share list that does not sum to 1 fails. A presence run given a shorter visit range turns wallets over faster than the same run on the shipped object.
-- Director: a Manila 03:00 timestamp yields the window [300, 600]. A Manila 21:00 timestamp yields a 300-wide window inside [3000, 6000]. Samples from 07:00 to 17:00 move the center upward. A spring stepped across ten minutes of a large gap does not teleport. A hot tape and a flat tape move the target in opposite directions, each inside the spare-room budget, and a 03:00 hot tape stays inside [300, 600].
+- Director: a Manila 03:00 timestamp yields the window [600, 1200]. A Manila 21:00 timestamp yields a 600-wide window inside [6000, 12000]. Samples from 07:00 to 17:00 move the center upward. A spring stepped across ten minutes of a large gap does not teleport. A hot tape and a flat tape move the target in opposite directions, each inside the spare-room budget, and a 03:00 hot tape stays inside [600, 1200]. Ramp pace from off-peak aims inside the peak box and moves farther in one second than the glide. A pin keeps the glide pace.
 - Presence: raising the target wakes that many, and only that many. Hysteresis keeps a wallet seated when the cutoff jitters by a few ranks. A wallet whose visit has ended is first out when the room shrinks, and a wallet whose visit is about to start is first in when a chair is free. A flat tape may shorten visits, and the next due wallets backfill so the count stays inside the window. The same seed repeats arrivals. The key file never shrinks.
 - Stakes: across thousands of seeded draws, whole-dollar amounts are rare, nothing is under $1, the median is small, and the same seed repeats. Restless stakes stay in the small cent mass.
 - Decide: a rising tape and a cheap up-pool produces an up bet for a tape persona. A fade persona on that tape takes down or skips. A price persona skips the twitch and bets when the pool is off its number. A fair pool produces a skip. Two minds can take opposite sides of the same shadow book. Across a seeded hour, one awake wallet bets in flurries and skips most windows. A moving tape raises the rate and still leaves most awake wallets out of that batch. The same seed repeats.

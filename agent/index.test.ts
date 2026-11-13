@@ -13,6 +13,7 @@ test("a split scales one crowd across the two markets", () => {
     window: [300, 500] as [number, number],
     target: 400,
     online: 400,
+    perSecond: 30,
   }
   expect(scaleCrowd(view, 100)).toBe(view)
   expect(scaleCrowd(view, 50)).toMatchObject({ online: 200, target: 200, center: 200, window: [150, 250] })

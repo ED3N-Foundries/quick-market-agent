@@ -99,12 +99,16 @@ test("an old control file still means follow the clock", () => {
   expect(control.buyInPaused).toBe(false)
   expect(parseControl({ bettingPaused: true }).buyInPaused).toBe(true)
   expect(parseControl({ buyInPaused: false, bettingPaused: true }).buyInPaused).toBe(false)
+  expect(parseControl({ mode: "ramp" }).mode).toBe("ramp")
   const legacy = parseSnapshot({ ...snapshot(), buyInPaused: undefined, bettingPaused: true, book: { ...snapshot().book, buyIns: undefined, bets: 9 } })
   expect(legacy?.buyInPaused).toBe(true)
   expect(legacy?.book.buyIns).toBe(9)
 })
 
 test("dashboard keys steer the swarm without listing every wallet", () => {
+  const ramped = handleKey(state(), "a", null, 0)
+  expect(ramped.state.control.mode).toBe("ramp")
+  expect(ramped.state.control.pin).toBeNull()
   const pinned = handleKey(state(), "]", null, 0)
   expect(pinned.state.control.mode).toBe("pin")
   expect(pinned.state.control.pin).toBe(31)

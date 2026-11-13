@@ -1,5 +1,5 @@
 {
-  "mode": "clock",
+  "mode": "ramp",
   "pin": null,
   "buyInPaused": false,
   "paused": [],

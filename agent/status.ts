@@ -1,4 +1,4 @@
-export type ControlMode = "clock" | "off-peak" | "peak" | "pin"
+export type ControlMode = "clock" | "off-peak" | "peak" | "ramp" | "pin"
 
 export type ControlFile = {
   mode: ControlMode
@@ -72,7 +72,10 @@ export function parseControl(value: unknown): ControlFile {
   const empty = emptyControl()
   if (!value || typeof value !== "object") return empty
   const row = value as Record<string, unknown>
-  const mode = row.mode === "off-peak" || row.mode === "peak" || row.mode === "pin" || row.mode === "clock" ? row.mode : "clock"
+  const mode =
+    row.mode === "off-peak" || row.mode === "peak" || row.mode === "ramp" || row.mode === "pin" || row.mode === "clock"
+      ? row.mode
+      : "clock"
   const pin = typeof row.pin === "number" && Number.isFinite(row.pin) ? Math.max(1, Math.round(row.pin)) : null
   const paused = Array.isArray(row.paused)
     ? row.paused.filter((item): item is string => typeof item === "string").map((item) => item.toLowerCase())

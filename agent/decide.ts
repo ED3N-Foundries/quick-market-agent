@@ -61,10 +61,23 @@ export function freshGate(index: number, windowId: number, persona: Persona, con
   }
 }
 
+/** Longest gap `drawGap` can arm. A saved gate past this is from an older window length. */
+export const MAX_GATE_GAP = 96
+
 function drawGap(persona: Persona, scale: number, rng: Mulberry32, _config: PersonaConfig): number {
   const tempo = Math.max(1, persona.tempoWindows)
   const drawn = lerp(tempo * 2.4, Math.max(1, tempo * 0.55), easing.expoOut(mulberry32.sample(rng)))
-  return clamp(Math.round(drawn * scale), 1, 96)
+  return clamp(Math.round(drawn * scale), 1, MAX_GATE_GAP)
+}
+
+/**
+ * Keep a saved ready window when it still falls inside this clock.
+ * The 5-second ids sit about one epoch ahead of the 10-second ids, and a
+ * future check would leave those wallets due decades from now.
+ */
+export function keptReadyWindow(saved: number, nowWindow: number, stagger: number): number {
+  if (saved < nowWindow - 20 || saved > nowWindow + MAX_GATE_GAP) return nowWindow + stagger
+  return saved
 }
 
 export function tapeActivity(points: readonly PrintPoint[], now: number, lookbackMs: number): { ret: number; vol: number; activity: number } {

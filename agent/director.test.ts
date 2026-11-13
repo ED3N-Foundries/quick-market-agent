@@ -25,13 +25,13 @@ function viewAt(hour: number, tape = neutral, state?: DirectorState) {
 test("Manila 03:00 is the off-peak window", () => {
   const view = viewAt(3)
   expect(view.phase).toBe("off-peak")
-  expect(view.window).toEqual([300, 600])
+  expect(view.window).toEqual([600, 1_200])
   const hotView = viewAt(3, hot)
-  expect(hotView.window[0]).toBeGreaterThanOrEqual(300)
-  expect(hotView.window[1]).toBeLessThanOrEqual(600)
+  expect(hotView.window[0]).toBeGreaterThanOrEqual(600)
+  expect(hotView.window[1]).toBeLessThanOrEqual(1_200)
 })
 
-test("Manila 21:00 is a 300-wide window inside the peak box", () => {
+test("Manila 21:00 is a 600-wide window inside the peak box", () => {
   const view = viewAt(21)
   expect(view.phase).toBe("peak")
   expect(view.window[1] - view.window[0]).toBe(clock.windowWidth)
@@ -78,4 +78,47 @@ test("a hot tape and a flat tape move the peak target in opposite directions", (
   expect(Math.abs(quiet - calm)).toBeLessThanOrEqual(spare + 1e-6)
   expect(scheduleAt(now, hot, clock).window[0]).toBeGreaterThanOrEqual(clock.peak.box[0])
   expect(scheduleAt(now, flat, clock).window[1]).toBeLessThanOrEqual(clock.peak.box[1])
+})
+
+test("ramp pace aims at the peak box and outruns the glide", () => {
+  const now = manila(3)
+  const glide = stepDirector(createDirector(clock.floor), {
+    now,
+    dtSec: 1,
+    tape: neutral,
+    config: clock,
+    pin: null,
+    hold: null,
+    pace: "glide",
+  })
+  const ramp = stepDirector(createDirector(clock.floor), {
+    now,
+    dtSec: 1,
+    tape: neutral,
+    config: clock,
+    pin: null,
+    hold: null,
+    pace: "ramp",
+  })
+  expect(ramp.phase).toBe("ramp")
+  expect(ramp.target).toBeGreaterThanOrEqual(clock.peak.box[0])
+  expect(ramp.target).toBeLessThanOrEqual(clock.peak.box[1])
+  expect(ramp.perSecond).toBe(clock.ramp.perSecond)
+  expect(Math.abs(ramp.state.value - clock.floor)).toBeGreaterThan(Math.abs(glide.state.value - clock.floor))
+  expect(Math.abs(ramp.state.value - clock.floor)).toBeLessThanOrEqual(clock.ramp.perSecond + 0.01)
+})
+
+test("a pin keeps the glide pace", () => {
+  const view = stepDirector(createDirector(100), {
+    now: manila(3),
+    dtSec: 1,
+    tape: neutral,
+    config: clock,
+    pin: 40,
+    hold: null,
+    pace: "ramp",
+  })
+  expect(view.phase).toBe("pin")
+  expect(view.target).toBe(40)
+  expect(view.perSecond).toBe(clock.perSecond)
 })
