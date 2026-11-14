@@ -1,4 +1,9 @@
-import type { SwarmSnapshot } from "./status"
+import { Database } from "bun:sqlite"
+import { existsSync } from "node:fs"
+import { loadEnv } from "../server/env"
+import { activeChainKey } from "../server/activeChain"
+import { rosterAggregates, rosterSorted, type RosterDir, type RosterFilter, type RosterSort } from "./swarmdb"
+import { shortAddress, type SwarmSnapshot } from "./status"
 
 export type AgentHealthBook = {
   roundId: number | null
@@ -143,6 +148,154 @@ export function statsResponse(snapshot?: SwarmSnapshot | null): Response {
   return Response.json(statsBody(snapshot))
 }
 
+export type AgentRosterRow = {
+  idx: number
+  address: string
+  short: string
+  online: boolean
+  mind: string
+  bankrollMicros: number
+  lastSide: string | null
+  lastStakeMicros: number | null
+  lastSkip: string | null
+  wins: number
+  losses: number
+  wokeAt: number | null
+  sleptAt: number | null
+  updatedAt: number
+}
+
+export type AgentRosterBody =
+  | { ok: false; error: string }
+  | {
+      ok: true
+      chain: string
+      filter: RosterFilter
+      sort: RosterSort
+      dir: RosterDir
+      offset: number
+      limit: number
+      requestedLimit: number
+      capped: boolean
+      total: number
+      returned: number
+      truncated: boolean
+      hidden: { count: number; bankrollMicros: number; online: number } | null
+      rows: AgentRosterRow[]
+      at: number
+    }
+
+/** Hard caps keep a 12k-wallet table from ever overloading the runner. */
+export const ROSTER_MAX_LIMIT = 50
+export const ROSTER_MAX_OFFSET = 10_000
+export const ROSTER_CACHE_MS = 4_000
+const ROSTER_CHAINS = ["base-sepolia", "near-testnet"] as const
+const ROSTER_FILTERS: readonly RosterFilter[] = ["all", "woke", "richest", "stuck", "slept"]
+const ROSTER_SORTS: readonly RosterSort[] = ["bankroll", "wins", "updated", "idx", "woke", "slept"]
+
+const rosterCache = new Map<string, { at: number; body: AgentRosterBody }>()
+
+export function parseRosterQuery(url: URL): {
+  chain: string
+  filter: RosterFilter
+  sort: RosterSort
+  dir: RosterDir
+  offset: number
+  limit: number
+  requestedLimit: number
+  capped: boolean
+} {
+  const params = url.searchParams
+  const rawChain = params.get("chain")?.trim() ?? ""
+  const chain = (ROSTER_CHAINS as readonly string[]).includes(rawChain) ? rawChain : activeChainKey()
+  const rawFilter = params.get("filter")?.trim() as RosterFilter | null
+  const filter: RosterFilter = ROSTER_FILTERS.includes(rawFilter as RosterFilter) ? (rawFilter as RosterFilter) : "all"
+  const rawSort = params.get("sort")?.trim() as RosterSort | null
+  const sort: RosterSort = ROSTER_SORTS.includes(rawSort as RosterSort) ? (rawSort as RosterSort) : "bankroll"
+  const rawDir = params.get("dir")?.trim().toLowerCase()
+  const dir: RosterDir = rawDir === "asc" ? "asc" : "desc"
+  const rawOffset = Number(params.get("offset") ?? "0")
+  const rawLimit = Number(params.get("limit") ?? "25")
+  const requestedLimit = Number.isFinite(rawLimit) ? Math.max(1, Math.floor(rawLimit)) : 25
+  const limit = Math.min(requestedLimit, ROSTER_MAX_LIMIT)
+  const offset = Number.isFinite(rawOffset) ? Math.min(Math.max(0, Math.floor(rawOffset)), ROSTER_MAX_OFFSET) : 0
+  const capped = requestedLimit !== limit || (Number.isFinite(rawOffset) && Math.floor(rawOffset) !== offset)
+  return { chain, filter, sort, dir, offset, limit, requestedLimit, capped }
+}
+
+export function rosterBody(query: ReturnType<typeof parseRosterQuery>): AgentRosterBody {
+  const key = `${query.chain}|${query.filter}|${query.sort}|${query.dir}|${query.offset}|${query.limit}`
+  const now = Date.now()
+  const cached = rosterCache.get(key)
+  if (cached && now - cached.at < ROSTER_CACHE_MS) return cached.body
+  const path = loadEnv().dbPath
+  if (!existsSync(path)) {
+    const body: AgentRosterBody = {
+      ok: true, chain: query.chain, filter: query.filter, sort: query.sort, dir: query.dir,
+      offset: query.offset, limit: query.limit, requestedLimit: query.requestedLimit, capped: query.capped,
+      total: 0, returned: 0, truncated: false, hidden: null, rows: [], at: now,
+    }
+    rosterCache.set(key, { at: now, body })
+    return body
+  }
+  const db = new Database(path, { readonly: true })
+  try {
+    const agg = rosterAggregates(db, query.filter, query.chain as "base-sepolia" | "near-testnet")
+    const stored = rosterSorted(db, query.filter, query.sort, query.dir, query.offset, query.limit, query.chain as "base-sepolia" | "near-testnet")
+    const rows: AgentRosterRow[] = stored.map((row) => ({
+      idx: row.idx,
+      address: row.address,
+      short: shortAddress(row.address),
+      online: row.online === 1,
+      mind: row.mind,
+      bankrollMicros: row.bankroll,
+      lastSide: row.lastSide,
+      lastStakeMicros: row.lastStake,
+      lastSkip: row.lastSkip,
+      wins: row.wins,
+      losses: row.losses,
+      wokeAt: row.wokeAt,
+      sleptAt: row.sleptAt,
+      updatedAt: row.updatedAt,
+    }))
+    const pageBankroll = rows.reduce((sum, row) => sum + row.bankrollMicros, 0)
+    const pageOnline = rows.filter((row) => row.online).length
+    // Hidden = everything not on this page (head skipped by offset + tail past the page).
+    const hidden = agg.total > rows.length ? {
+      count: agg.total - rows.length,
+      bankrollMicros: agg.bankrollMicros - pageBankroll,
+      online: agg.online - pageOnline,
+    } : null
+    const body: AgentRosterBody = {
+      ok: true, chain: query.chain, filter: query.filter, sort: query.sort, dir: query.dir,
+      offset: query.offset, limit: query.limit, requestedLimit: query.requestedLimit, capped: query.capped,
+      total: agg.total, returned: rows.length, truncated: hidden !== null, hidden, rows, at: now,
+    }
+    rosterCache.set(key, { at: now, body })
+    // Keep the cache bounded: one entry per distinct page, cap at 40 pages.
+    if (rosterCache.size > 40) {
+      const oldest = [...rosterCache.entries()].sort((a, b) => a[1].at - b[1].at)[0]
+      if (oldest) rosterCache.delete(oldest[0])
+    }
+    return body
+  } finally {
+    db.close()
+  }
+}
+
+export function rosterResponse(url: URL): Response {
+  try {
+    return Response.json(rosterBody(parseRosterQuery(url)))
+  } catch (error) {
+    return Response.json({ ok: false, error: error instanceof Error ? error.message : "roster failed" }, { status: 500 })
+  }
+}
+
+/** Test hook: clear the 4s roster cache. */
+export function resetRosterCacheForTest(): void {
+  rosterCache.clear()
+}
+
 /** Bind the stats listener. `STATS_PORT=0` (and an explicit port of 0) leaves it off. */
 export function startStatsServer(port = statsPort()): ReturnType<typeof Bun.serve> | null {
   if (port <= 0) return null
@@ -153,6 +306,7 @@ export function startStatsServer(port = statsPort()): ReturnType<typeof Bun.serv
       fetch(req) {
         const url = new URL(req.url)
         if (req.method === "GET" && url.pathname === "/api/health") return statsResponse()
+        if (req.method === "GET" && url.pathname === "/api/roster") return rosterResponse(url)
         return Response.json({ error: "Not found" }, { status: 404 })
       },
     })

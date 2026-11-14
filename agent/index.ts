@@ -438,15 +438,18 @@ async function trade(share: number): Promise<void> {
       const near = activeChainKey() === "near-testnet"
       const enrollGap = near ? swarmConfig.runner.rampEnrollGapMs : swarmConfig.runner.enrollGapMs
       const coolingNow = isCoolingError(lastError)
+      // Seed: first 5 trade next window even when the crowd target is smaller.
+      const seedActive = enrolledWallets.length < 5
+      const wantedEnroll = seedActive ? Math.max(5, Math.ceil(view.online)) : Math.ceil(view.online)
+      const width = seedActive ? 5 : near ? swarmConfig.runner.rampEnrollWidth : swarmConfig.runner.enrollWidth
       if (
         !enrolling &&
         now >= nextEnrollBatch &&
-        (needsSignIn || (!coolingNow && enrolledWallets.length < Math.min(swarmConfig.runner.keyCap, Math.ceil(view.online))))
+        (needsSignIn || (!coolingNow && enrolledWallets.length < Math.min(swarmConfig.runner.keyCap, wantedEnroll)))
       ) {
         enrolling = true
         nextEnrollBatch = now + enrollGap
-        const enrollWidth = near ? swarmConfig.runner.rampEnrollWidth : swarmConfig.runner.enrollWidth
-        void enrollDue(wallets, chain.id, now, Math.ceil(view.online), enrollWidth, flow, (message) => {
+        void enrollDue(wallets, chain.id, now, wantedEnroll, width, flow, (message) => {
           lastError = message
         }, coolingNow).finally(() => {
           enrolling = false

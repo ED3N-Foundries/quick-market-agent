@@ -87,6 +87,9 @@ export type WalletRow = {
 
 export type RosterFilter = "all" | "stuck" | "richest" | "woke" | "slept"
 
+export type RosterSort = "bankroll" | "wins" | "updated" | "idx" | "woke" | "slept"
+export type RosterDir = "asc" | "desc"
+
 export function openSwarm(source: string | Database): Database {
   const db = typeof source === "string" ? openFile(source) : source
   db.exec(SCHEMA)
@@ -268,6 +271,67 @@ export function rosterCount(db: Database, filter: RosterFilter, chainKey = activ
   }[filter]
   const row = db.query(`SELECT COUNT(*) AS n FROM wallets WHERE chain_key = ? AND ${condition}`).get(chainKey) as { n: number }
   return row.n
+}
+
+const ROSTER_SORT_COL: Record<RosterSort, string> = {
+  bankroll: "bankroll",
+  wins: "wins",
+  updated: "updated_at",
+  idx: "idx",
+  woke: "woke_at",
+  slept: "slept_at",
+}
+
+/** Sorted page. Sort/dir are whitelisted; offset/limit are clamped by the caller. */
+export function rosterSorted(
+  db: Database,
+  filter: RosterFilter,
+  sort: RosterSort,
+  dir: RosterDir,
+  offset: number,
+  limit: number,
+  chainKey = activeChainKey(),
+): WalletRow[] {
+  const condition = {
+    richest: "enrolled = 1",
+    woke: "enrolled = 1 AND online = 1",
+    slept: "enrolled = 1 AND online = 0",
+    stuck: "enrolled = 1 AND online = 1 AND last_skip IN ('refractory', 'flat')",
+    all: "enrolled = 1",
+  }[filter]
+  const col = ROSTER_SORT_COL[sort] ?? "bankroll"
+  const direction = dir === "asc" ? "ASC" : "DESC"
+  // Nullable timestamps sort as 0 so never-enrolled timestamps stay at the bottom.
+  const orderExpr = col === "woke_at" || col === "slept_at" || col === "updated_at" ? `COALESCE(${col}, 0)` : col
+  return (
+    db
+      .query(
+        `SELECT * FROM wallets WHERE chain_key = ? AND ${condition} ORDER BY ${orderExpr} ${direction}, idx ASC LIMIT ? OFFSET ?`,
+      )
+      .all(chainKey, limit, offset) as Record<string, unknown>[]
+  ).map(mapRow)
+}
+
+/** Totals for the truncated summary: what the page left hidden. */
+export function rosterAggregates(
+  db: Database,
+  filter: RosterFilter,
+  chainKey = activeChainKey(),
+): { total: number; bankrollMicros: number; online: number } {
+  const condition = {
+    richest: "enrolled = 1",
+    woke: "enrolled = 1 AND online = 1",
+    slept: "enrolled = 1 AND online = 0",
+    stuck: "enrolled = 1 AND online = 1 AND last_skip IN ('refractory', 'flat')",
+    all: "enrolled = 1",
+  }[filter]
+  const row = db
+    .query(
+      `SELECT COUNT(*) AS n, COALESCE(SUM(bankroll), 0) AS bankroll, COALESCE(SUM(CASE WHEN online = 1 THEN 1 ELSE 0 END), 0) AS online
+       FROM wallets WHERE chain_key = ? AND ${condition}`,
+    )
+    .get(chainKey) as { n: number; bankroll: number; online: number }
+  return { total: row.n, bankrollMicros: row.bankroll, online: row.online }
 }
 
 function mapRow(row: Record<string, unknown>): WalletRow {

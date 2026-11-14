@@ -466,7 +466,7 @@ const swarmInput: SwarmConfig = {
     presenceTickMs: 1_000,
     keyCap: 12_000,
     enrollGapMs: 1_000,
-    rampEnrollWidth: 4,
+    rampEnrollWidth: 5,
     rampEnrollGapMs: 8_000,
   },
   timing: {
