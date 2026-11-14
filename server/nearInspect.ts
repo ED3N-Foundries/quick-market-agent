@@ -16,8 +16,9 @@ export function nearRpcUrl(): string {
 async function rpc(method: string, params: unknown): Promise<unknown> {
   const response = await fetch(nearRpcUrl(), {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", "user-agent": "quick-market-agent" },
     body: JSON.stringify({ jsonrpc: "2.0", id: "quick-market-agent", method, params }),
+    signal: AbortSignal.timeout(5_000),
   })
   if (!response.ok) throw new Error(`NEAR RPC returned ${response.status}`)
   const body = (await response.json()) as { result?: unknown; error?: { message?: string } }

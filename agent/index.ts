@@ -1028,6 +1028,7 @@ async function audit(wallets: Map<string, LiveWallet>, cursor: number, setCursor
 }
 
 async function bankPass(wallets: Map<string, LiveWallet>, flow: FlowFile, fail: (message: string) => void) {
+  let coolingLogged = false
   for (const wallet of wallets.values()) {
     if (!wallet.enrolled) continue
     const action = bankAction(wallet.bankroll, wallet.index, swarmConfig.bank, wallet.handled)
@@ -1044,6 +1045,14 @@ async function bankPass(wallets: Map<string, LiveWallet>, flow: FlowFile, fail: 
       noteTransport(wallets, response)
       fail(typeof response.body.error === "string" ? response.body.error : "Withdrawal failed")
       return
+    }
+    const body = response.body as { error?: unknown; code?: unknown; balanceMicros?: unknown }
+    if (body.code === "NEAR_COOLING") {
+      if (!coolingLogged) {
+        coolingLogged = true
+        console.error("withdraw paused: NEAR funding cooling, retryable")
+      }
+      continue
     }
     if (!response.ok || typeof response.body.balanceMicros !== "number") {
       fail(typeof response.body.error === "string" ? response.body.error : "Withdrawal failed")
