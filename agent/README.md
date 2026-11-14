@@ -1,6 +1,6 @@
 # Agents
 
-`bun run agent` is one Bun process for the whole swarm. It follows Asia/Manila (UTC+8, no daylight saving). The preference window is 600–1,200 wallets from 02:00 to 07:00, eases up through the morning, wanders inside 6,000–12,000 from 17:00 to 23:00, and eases back overnight. The live count chases that window and can trail it by minutes. Ramp mode fills the peak window at 80 wallets a second. Wallets sleep when the room shrinks. Their keys stay. Sign-in batches stay sliced. Base rebinds 32 wallets a second. NEAR signs in 4 wallets every 8 seconds, because a first sign-in opens a grant.
+`bun run agent` is one Bun process for the whole swarm. It follows Asia/Manila (UTC+8, no daylight saving). The preference window is 600–1,200 wallets from 02:00 to 07:00, eases up through the morning, wanders inside 6,000–12,000 from 17:00 to 23:00, and eases back overnight. The live count chases that window and can trail it by minutes. Ramp mode fills the peak window at 80 wallets a second. Wallets sleep when the room shrinks. Their keys stay. Stored sessions resume in batches of 1,000, so a restart gets the existing crowd back in seconds. First-time grants stay sliced: Base signs in 32 wallets a second, NEAR 5 every 8 seconds.
 
 Each wallet buys in for itself. Stakes are uneven cents, usually a few dollars, sized from the wallet and from the last four windows of tape when that history exists. Inside a buy-in window, tape minds buy earlier and fade and price minds buy later, against the pool those earlier buy-ins just filled. A balance under $3 stays where it is. A balance over $1,000 is withdrawn to that wallet. The runner does not claim the testnet grant.
 
@@ -8,7 +8,7 @@ Each wallet buys in for itself. Stakes are uneven cents, usually a few dollars, 
 
 The runner is one MCP client of `API_URL` + `/mcp`. It signs each wallet in once with the normal login message, keeps the session token, and uses that connection to read the book, place buy-ins, check balances, and withdraw.
 
-Edit `agent/config.ts`. That file is the schedule, the minds, the stake shape, and the runner batch sizes. `agent/control.json` only steers a running swarm: follow the clock, hold off-peak, hold peak, ramp to the peak, pin a count, pause buy-ins, or freeze mints and burns.
+Edit `agent/config.ts`. That file is the schedule, the minds, the stake shape, the runner batch sizes, the fast session repair, and the rolling stake cleanup. `agent/control.json` only steers a running swarm: follow the clock, hold off-peak, hold peak, ramp to the peak, pin a count, pause buy-ins, or freeze mints and burns. In the container the live file is `/data/agent/control.json`; a fresh volume copies the shipped default there.
 
 `bun run agents` is the dashboard. It reads `agent/swarm.json` and the active chain's agent rows in `data/quick-market.sqlite`. Closing it leaves the runner up. A non-interactive run prints one page from `agent/status.json` and `agent/flow.json`.
 

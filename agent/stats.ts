@@ -13,6 +13,9 @@ export type AgentHealthBook = {
   botDownMicros: number
   buyIns: number
   skips: number
+  attempted?: number
+  rejected?: number
+  lastReject?: string | null
   p50: number
   p90: number
 }
@@ -35,6 +38,7 @@ export type AgentHealthLive = {
   window: [number, number]
   online: number
   enrolled: number | null
+  bound: number | null
   pid: number | null
   spring: number
   target: number
@@ -101,6 +105,9 @@ export function statsBody(snapshot: SwarmSnapshot | null = latest): AgentHealthB
     botDownMicros: finite(snapshot.book.botDownMicros),
     buyIns: finite(snapshot.book.buyIns),
     skips: finite(snapshot.book.skips),
+    attempted: finite(snapshot.book.attempted ?? 0),
+    rejected: finite(snapshot.book.rejected ?? 0),
+    lastReject: typeof snapshot.book.lastReject === "string" ? snapshot.book.lastReject.slice(0, 300) : null,
     p50: finite(snapshot.book.p50),
     p90: finite(snapshot.book.p90),
   }
@@ -114,6 +121,7 @@ export function statsBody(snapshot: SwarmSnapshot | null = latest): AgentHealthB
     window: [finite(snapshot.window[0]), finite(snapshot.window[1])],
     online: finite(snapshot.online),
     enrolled: typeof snapshot.enrolled === "number" && Number.isFinite(snapshot.enrolled) ? snapshot.enrolled : null,
+    bound: typeof snapshot.bound === "number" && Number.isFinite(snapshot.bound) ? snapshot.bound : null,
     pid: typeof snapshot.pid === "number" && Number.isFinite(snapshot.pid) ? snapshot.pid : null,
     spring: finite(snapshot.spring),
     target: finite(snapshot.target),

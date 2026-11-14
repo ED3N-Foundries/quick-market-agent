@@ -3,7 +3,19 @@ import { expect, test } from "bun:test"
 import { mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { loadWalletMap, metaGet, metaSet, openSwarm, saveStakes, saveWallets, stakesFor, type WalletRow } from "./swarmdb"
+import {
+  loadWalletMap,
+  metaGet,
+  metaSet,
+  noteWindow,
+  openSwarm,
+  pruneStakes,
+  resetWindowEpoch,
+  saveStakes,
+  saveWallets,
+  stakesFor,
+  type WalletRow,
+} from "./swarmdb"
 
 function wallet(address: string, bankroll: number): WalletRow {
   return {
@@ -54,6 +66,38 @@ test("agent wallets, stakes, and cursors are chain-scoped in one database", () =
     saved.token = "abc"
     saveWallets(db, [saved], "base-sepolia")
     expect(loadWalletMap(db, "base-sepolia").get("0xabc")?.token).toBe("abc")
+  } finally {
+    db.close()
+  }
+})
+
+test("rolling cleanup drops old stakes and an epoch reset clears the round tables", () => {
+  const db = openSwarm(":memory:")
+  try {
+    saveStakes(db, 10, [{ address: "old", side: "up", stakeMicros: 10 }], "base-sepolia")
+    saveStakes(db, 100, [{ address: "new", side: "down", stakeMicros: 20 }], "base-sepolia")
+    pruneStakes(db, 50, "base-sepolia")
+    expect(stakesFor(db, 10, "base-sepolia")).toEqual([])
+    expect(stakesFor(db, 100, "base-sepolia")).toHaveLength(1)
+
+    for (let index = 0; index < 200; index++) {
+      noteWindow(
+        db,
+        { id: 1_000 + index, buyIns: 0, skips: 0, upMicros: 0, downMicros: 0, at: 1_000 + index },
+        "base-sepolia",
+      )
+    }
+    // A window-length change moves ids backwards. Wall time, not id, keeps the new row.
+    noteWindow(db, { id: 5, buyIns: 1, skips: 0, upMicros: 0, downMicros: 0, at: 999_999 }, "base-sepolia")
+    const kept = db.query("SELECT id FROM windows WHERE chain_key = ? ORDER BY at DESC LIMIT 1").get("base-sepolia") as {
+      id: number
+    }
+    expect(kept.id).toBe(5)
+    expect((db.query("SELECT COUNT(*) AS n FROM windows WHERE chain_key = ?").get("base-sepolia") as { n: number }).n).toBe(200)
+
+    resetWindowEpoch(db, "base-sepolia")
+    expect(stakesFor(db, 100, "base-sepolia")).toEqual([])
+    expect((db.query("SELECT COUNT(*) AS n FROM windows WHERE chain_key = ?").get("base-sepolia") as { n: number }).n).toBe(0)
   } finally {
     db.close()
   }

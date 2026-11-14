@@ -194,11 +194,28 @@ export function noteWindow(
      ON CONFLICT(chain_key, id) DO UPDATE SET buy_ins = excluded.buy_ins, skips = excluded.skips, up_micros = excluded.up_micros,
        down_micros = excluded.down_micros, at = excluded.at`,
   ).run(chainKey, row.id, row.buyIns, row.skips, row.upMicros, row.downMicros, row.at)
+  // Keep the newest rows by wall time, not by round id. A window-length change
+  // makes old ids larger than current ones, so id order would evict new rows.
   db.query(
     `DELETE FROM windows WHERE chain_key = ? AND id NOT IN (
-       SELECT id FROM windows WHERE chain_key = ? ORDER BY id DESC LIMIT 200
+       SELECT id FROM windows WHERE chain_key = ? ORDER BY at DESC, id DESC LIMIT 200
      )`,
   ).run(chainKey, chainKey)
+}
+
+/** Drop settled stakes older than the replay window. Safe because the cursor has passed them. */
+export function pruneStakes(db: Database, beforeRound: number, chainKey = activeChainKey()) {
+  if (!Number.isSafeInteger(beforeRound) || beforeRound <= 0) return
+  db.query("DELETE FROM stakes WHERE chain_key = ? AND round_id < ?").run(chainKey, beforeRound)
+}
+
+/** A round-id epoch change invalidates every local stake and window row. */
+export function resetWindowEpoch(db: Database, chainKey = activeChainKey()) {
+  const tx = db.transaction(() => {
+    db.query("DELETE FROM stakes WHERE chain_key = ?").run(chainKey)
+    db.query("DELETE FROM windows WHERE chain_key = ?").run(chainKey)
+  })
+  tx()
 }
 
 export function saveStakes(

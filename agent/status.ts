@@ -23,6 +23,9 @@ export type BookSnap = {
   botDownMicros: number
   buyIns: number
   skips: number
+  attempted?: number
+  rejected?: number
+  lastReject?: string | null
   p50: number
   p90: number
 }
@@ -43,6 +46,7 @@ export type SwarmSnapshot = {
   window: [number, number]
   online: number
   enrolled?: number
+  bound?: number
   pid?: number | null
   running?: boolean
   spring: number

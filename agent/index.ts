@@ -28,7 +28,6 @@ import { peekApiEndpoint, refreshApiEndpoint } from "./endpoint"
 import { histogram, manilaClock, parseControl, parseFlow, percentiles, type FlowFile, type SwarmSnapshot } from "./status"
 import { publishStats, startStatsServer } from "./stats"
 import { CONTROL_PATH, FLOW_PATH, KEYS_PATH, NEAR_KEYS_PATH, STATUS_PATH, SWARM_PATH, readJson, writeJsonAtomic } from "./store"
-import { ACTIVE_KEEP, loadActiveFive } from "./active"
 import {
   loadWalletMap,
   metaGet,
@@ -36,7 +35,9 @@ import {
   minStakeRoundAfter,
   noteWindow,
   openSwarm,
+  pruneStakes,
   pruneUnenrolled,
+  resetWindowEpoch,
   saveStakes,
   saveWallets,
   stakesFor,
@@ -181,6 +182,18 @@ async function trade(share: number): Promise<void> {
   importLegacySwarm(db, loadEnv().dbPath)
   openSwarm(db)
   pruneUnenrolled(db)
+  const windowKey = String(windowMs())
+  const storedWindow = metaGet(db, "window_ms")
+  if (storedWindow === null) {
+    metaSet(db, "window_ms", windowKey)
+  } else if (storedWindow !== windowKey) {
+    // Round ids are derived from the window length. A change invalidates every
+    // local stake/window row and moves the clock to a different id space.
+    resetWindowEpoch(db)
+    metaSet(db, "settle_cursor", String(Math.max(0, Math.floor(Date.now() / windowMs()) - 1)))
+    metaSet(db, "window_ms", windowKey)
+    console.error(`window length changed ${storedWindow}ms -> ${windowKey}ms; local round epoch reset`)
+  }
   let keys: { address: string; privateKey: string }[]
   if (near) {
     keys = loadNearKeyFile().map((key) => ({ address: key.account, privateKey: key.privateKey }))
@@ -234,6 +247,7 @@ async function trade(share: number): Promise<void> {
   let auditAt = 0
   let auditCursor = 0
   let bankAt = 0
+  let cleanupAt = 0
   let enrolling = false
   let nextEnrollBatch = 0
   let banking = false
@@ -252,22 +266,19 @@ async function trade(share: number): Promise<void> {
   const storedFlow = readJson(laneFlowPath(chainKey)) ?? (chainKey === "base-sepolia" ? readJson(FLOW_PATH) : null)
   let flow = parseFlow(storedFlow)
   let lastError: string | null = null
-  let windowStats = { roundId: null as number | null, buyIns: 0, skips: 0, up: 0, down: 0, stakes: [] as number[] }
+  let windowStats = {
+    roundId: null as number | null,
+    buyIns: 0,
+    skips: 0,
+    up: 0,
+    down: 0,
+    stakes: [] as number[],
+    attempted: 0,
+    rejected: 0,
+    lastReject: null as string | null,
+  }
   let lastView: DirectorView | null = null
   let stopping = false
-  let activeFive: string[] = []
-  let lastActiveRefresh = 0
-  const refreshActiveFive = (now: number, force = false) => {
-    if (!force && now - lastActiveRefresh < 60_000 && activeFive.length > 0) return activeFive
-    lastActiveRefresh = now
-    try {
-      activeFive = loadActiveFive(db, now, windowMs(), chainKey, ACTIVE_KEEP)
-    } catch {
-      // keep last known pin on DB errors
-    }
-    return activeFive
-  }
-  refreshActiveFive(Date.now(), true)
 
   const flush = (running = !stopping) => {
     const dirty = [...wallets.values()].filter((wallet) => wallet.dirty && wallet.enrolled).map((wallet) => toRow(wallet))
@@ -277,6 +288,10 @@ async function trade(share: number): Promise<void> {
     metaSet(db, "velocity", String(director.velocity))
     metaSet(db, "settle_cursor", String(cursor))
     metaSet(db, "trace", JSON.stringify(trace.slice(-180)))
+    metaSet(db, "book_join", String(book?.joinId ?? -1))
+    metaSet(db, "book_at", String(bookAt ?? 0))
+    metaSet(db, "last_error", lastError ?? "")
+    metaSet(db, "bound", String(walletsBound(wallets)))
     const snapshot = buildSnapshot({
       now: Date.now(),
       view: lastView,
@@ -434,10 +449,9 @@ async function trade(share: number): Promise<void> {
         wallet.dirty = true
         leftMinute += 1
       }
-      // Warm keep: weekly most-active stay online so the book is never empty.
+      // Warm keep: a handful of funded wallets stay online so the book is never empty.
       // They still need bound + enrolled to trade; this only overrides sleep.
-      const activeSet = new Set(refreshActiveFive(now))
-      for (const address of warmKeepAddresses(wallets, activeSet, ACTIVE_KEEP)) {
+      for (const address of warmKeepAddresses(wallets, swarmConfig.runner.seedCount)) {
         const wallet = wallets.get(address)
         if (!wallet || !wallet.enrolled || !wallet.bound || wallet.online) continue
         wallet.online = true
@@ -449,35 +463,55 @@ async function trade(share: number): Promise<void> {
       while (recent.length > 0 && now - recent[0]!.at > swarmConfig.presence.herdWindowMs) recent.shift()
 
       flush()
-      const needsSignIn = [...wallets.values()].some((wallet) => wallet.enrolled && !wallet.bound && wallet.nextEnroll <= now)
+      const needsRepair = [...wallets.values()].some((wallet) => wallet.enrolled && !wallet.bound && wallet.nextEnroll <= now)
       const near = activeChainKey() === "near-testnet"
-      const enrollGap = near ? swarmConfig.runner.rampEnrollGapMs : swarmConfig.runner.enrollGapMs
       const coolingNow = isCoolingError(lastError)
-      // Seed: first 5 trade next window even when the crowd target is smaller.
-      const seedActive = enrolledWallets.length < 5
-      const wantedEnroll = seedActive ? Math.max(5, Math.ceil(view.online)) : Math.ceil(view.online)
-      const width = seedActive ? 5 : near ? swarmConfig.runner.rampEnrollWidth : swarmConfig.runner.enrollWidth
+      // Seed: the first batch trades in the next window even when the crowd target is smaller.
+      const seedActive = enrolledWallets.length < swarmConfig.runner.seedCount
+      const wantedEnroll = seedActive
+        ? Math.max(swarmConfig.runner.seedCount, Math.ceil(view.online))
+        : Math.ceil(view.online)
+      const freshWidth = seedActive
+        ? swarmConfig.runner.seedCount
+        : near
+          ? swarmConfig.runner.rampEnrollWidth
+          : swarmConfig.runner.enrollWidth
+      // A stored session token is cheap to re-establish and never mints, so repair
+      // the existing crowd at once instead of making it wait behind the grant rate.
+      const width = needsRepair ? swarmConfig.runner.repairWidth : freshWidth
+      const enrollGap = needsRepair
+        ? swarmConfig.runner.repairGapMs
+        : near
+          ? swarmConfig.runner.rampEnrollGapMs
+          : swarmConfig.runner.enrollGapMs
       if (
         !enrolling &&
         now >= nextEnrollBatch &&
-        (needsSignIn || (!coolingNow && enrolledWallets.length < Math.min(swarmConfig.runner.keyCap, wantedEnroll)))
+        (needsRepair || (!coolingNow && enrolledWallets.length < Math.min(swarmConfig.runner.keyCap, wantedEnroll)))
       ) {
         enrolling = true
         nextEnrollBatch = now + enrollGap
-        void enrollDue(wallets, chain.id, now, wantedEnroll, width, flow, (message) => {
+        void enrollDue(wallets, chain.id, now, wantedEnroll, width, !needsRepair, flow, (message) => {
           lastError = message
-        }, coolingNow, activeSet).finally(() => {
-          enrolling = false
-        })
+        }, coolingNow)
+          .catch((error) => {
+            lastError = error instanceof Error ? error.message : "Enrollment failed"
+          })
+          .finally(() => {
+            enrolling = false
+          })
       }
 
-      if (lastJoin !== joinId) {
+      const bookAge = bookAt === null ? Number.POSITIVE_INFINITY : now - bookAt
+      if (lastJoin !== joinId || bookAge >= 1_000) {
         const loaded = await takeBook()
         if (loaded) {
           book = loaded
           bookAt = Date.now()
           lastError = null
-          lastJoin = joinId
+          // A response can land just after a boundary and carry the previous join.
+          // Track what the book actually says, not the clock we asked under.
+          lastJoin = loaded.joinId
         } else lastError = "Book did not load"
       }
 
@@ -532,7 +566,17 @@ async function trade(share: number): Promise<void> {
             fireAt: fireAt(wallet.index, wallet.persona.mind, book.joinId, openAt, book.windowEndsAt, swarmConfig.timing),
           })
         }
-        windowStats = { roundId: book.joinId, buyIns: 0, skips, up: 0, down: 0, stakes: [] }
+        windowStats = {
+          roundId: book.joinId,
+          buyIns: 0,
+          skips,
+          up: 0,
+          down: 0,
+          stakes: [],
+          attempted: 0,
+          rejected: 0,
+          lastReject: null,
+        }
         builtJoin = joinId
         if (queue.length === 0) {
           noteWindow(db, { id: book.joinId, buyIns: 0, skips, upMicros: 0, downMicros: 0, at: now })
@@ -543,7 +587,7 @@ async function trade(share: number): Promise<void> {
         builtJoin = joinId
       }
 
-      if (wave && !buyInPaused && now < wave.endsAt - 150) {
+      if (wave && !buyInPaused && now < wave.endsAt - swarmConfig.timing.marginMs) {
         const open = wave
         const loaded = await takeBook()
         if (loaded) {
@@ -638,6 +682,9 @@ async function trade(share: number): Promise<void> {
               windowStats.up += posted.up
               windowStats.down += posted.down
               windowStats.stakes.push(...posted.stakes)
+              windowStats.attempted += posted.attempted
+              windowStats.rejected += posted.rejected
+              if (posted.lastReject) windowStats.lastReject = posted.lastReject
             }
             if (wave.queue.length === 0) {
               noteWindow(db, {
@@ -651,7 +698,7 @@ async function trade(share: number): Promise<void> {
               wave = null
             }
         }
-      } else if (wave && now >= wave.endsAt - 150) {
+      } else if (wave && now >= wave.endsAt - swarmConfig.timing.marginMs) {
         dropQueued(wave)
         wave = null
       }
@@ -667,15 +714,29 @@ async function trade(share: number): Promise<void> {
         bankAt = now
         void bankPass(wallets, flow, (message) => {
           lastError = message
-        }).finally(() => {
-          banking = false
         })
+          .catch((error) => {
+            lastError = error instanceof Error ? error.message : "Bank pass failed"
+          })
+          .finally(() => {
+            banking = false
+          })
+      }
+      if (now - cleanupAt >= swarmConfig.runner.cleanupEveryMs) {
+        cleanupAt = now
+        const currentRound = Math.floor(now / windowMs())
+        const replayFloor = cursor > 0 ? Math.min(cursor, currentRound) : currentRound
+        pruneStakes(db, replayFloor - swarmConfig.runner.stakeRetentionRounds, chainKey)
       }
     } catch (error) {
       lastError = error instanceof Error ? error.message : "Swarm tick failed"
     }
-    void refreshApiEndpoint(loadEnv().apiUrl)
-    flush()
+    void refreshApiEndpoint(loadEnv().apiUrl).catch(() => undefined)
+    try {
+      flush()
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : "Snapshot write failed"
+    }
     const remain = book ? book.windowEndsAt - Date.now() : swarmConfig.runner.presenceTickMs
     const wait = Math.min(swarmConfig.runner.snapshotEveryMs, Math.max(40, remain))
     await sleep(wait)
@@ -792,14 +853,10 @@ function toRow(wallet: LiveWallet): WalletRow {
   }
 }
 
-function enrollRank(
-  wallet: LiveWallet,
-  active: Set<string>,
-): [number, number, number, number, number] {
-  // Active-five first, then restless (frequent traders), then low tempo,
-  // then richest, then lowest index. Ordering only — width/gap/cooldown unchanged.
+function enrollRank(wallet: LiveWallet): [number, number, number, number] {
+  // Restless (frequent traders) first, then low tempo, then richest, then lowest index.
+  // Ordering only; width and gap stay in the caller.
   return [
-    active.has(wallet.address) ? 0 : 1,
     wallet.persona.mind === "restless" ? 0 : 1,
     wallet.persona.tempoWindows,
     -wallet.bankroll,
@@ -807,11 +864,58 @@ function enrollRank(
   ]
 }
 
-function compareRank(left: [number, number, number, number, number], right: [number, number, number, number, number]): number {
+function compareRank(left: readonly number[], right: readonly number[]): number {
   for (let index = 0; index < left.length; index++) {
     if (left[index]! !== right[index]!) return left[index]! - right[index]!
   }
   return 0
+}
+
+let resumeSessionsUnsupported = false
+
+/** Re-establish stored sessions in a handful of calls instead of one per wallet. */
+async function resumeSessions(wallets: Map<string, LiveWallet>, fail: (message: string) => void): Promise<void> {
+  if (resumeSessionsUnsupported) return
+  const waiting = [...wallets.values()].filter((wallet) => wallet.enrolled && !wallet.bound && wallet.token)
+  if (waiting.length === 0) return
+  console.error(`resume_sessions: ${waiting.length} wallets waiting`)
+  const chunk = 1_000
+  for (let index = 0; index < waiting.length; index += chunk) {
+    const batch = waiting.slice(index, index + chunk)
+    const tokens = batch.flatMap((wallet) => (wallet.token ? [wallet.token] : []))
+    if (tokens.length === 0) continue
+    const reply = await callMarket("resume_sessions", { tokens }, 30_000)
+    if (reply.transport) {
+      noteTransport(wallets, reply)
+      fail(toolError(reply))
+      backOffRepair(waiting)
+      return
+    }
+    if (!reply.ok || !Array.isArray(reply.body.accepted)) {
+      const message = toolError(reply)
+      console.error(`resume_sessions failed: ${message}`)
+      fail(message)
+      if (/unknown tool|not found|method not found/i.test(message)) resumeSessionsUnsupported = true
+      backOffRepair(batch)
+      return
+    }
+    const accepted = new Set(reply.body.accepted.filter((item): item is string => typeof item === "string"))
+    for (const wallet of batch) {
+      if (!accepted.has(wallet.address)) continue
+      wallet.bound = true
+      wallet.enrolled = true
+      wallet.dirty = true
+    }
+    console.error(`resume_sessions: ${accepted.size}/${tokens.length} accepted`)
+  }
+}
+
+/** Do not hammer the market with the same failing batch every tick. */
+function backOffRepair(wallets: readonly LiveWallet[]) {
+  const until = Date.now() + 5_000
+  for (const wallet of wallets) {
+    if (!wallet.bound) wallet.nextEnroll = until
+  }
 }
 
 async function enrollDue(
@@ -820,24 +924,24 @@ async function enrollDue(
   now: number,
   wantedOnline: number,
   enrollWidth: number,
+  freshAllowed: boolean,
   _flow: FlowFile,
   fail: (message: string) => void,
   cooling = false,
-  active: Set<string> = new Set(),
 ) {
-  const rankOf = (wallet: LiveWallet) => enrollRank(wallet, active)
+  await resumeSessions(wallets, fail)
   const repair = [...wallets.values()]
     .filter((wallet) => wallet.enrolled && !wallet.bound && wallet.nextEnroll <= now)
-    .sort((left, right) => compareRank(rankOf(left), rankOf(right)))
+    .sort((left, right) => compareRank(enrollRank(left), enrollRank(right)))
   const enrolledCount = walletsEnrolled(wallets)
   const needed = Math.max(0, Math.min(swarmConfig.runner.keyCap, wantedOnline) - enrolledCount)
   // While cooling, never open fresh grants. Repair via stored token is safe (no mint).
   const fresh =
-    needed === 0 || cooling
+    !freshAllowed || needed === 0 || cooling
       ? []
       : [...wallets.values()]
           .filter((wallet) => !wallet.enrolled && wallet.nextEnroll <= now)
-          .sort((left, right) => compareRank(rankOf(left), rankOf(right)))
+          .sort((left, right) => compareRank(enrollRank(left), enrollRank(right)))
           .slice(0, Math.min(needed, enrollWidth))
   const due = [...repair, ...fresh].slice(0, enrollWidth)
   if (due.length === 0) return
@@ -846,22 +950,13 @@ async function enrollDue(
   })
 }
 
-/**
- * Dynamic active-five stay on the field so the book is never empty.
- * Falls back to restless-first ordering when the weekly pin is empty
- * (fresh deployment), so frequent traders are funded first.
- */
+/** A small funded set stays on the field so the book is never empty. */
 export function warmKeepAddresses(
   wallets: Map<string, { address: string; bankroll: number; enrolled: boolean; persona?: { mind: string; tempoWindows: number }; index?: number }>,
-  active: Set<string> | string[] | number = [],
   keep = 5,
 ): string[] {
-  // Backwards-compat: warmKeepAddresses(wallets, 5) still means keep=5.
-  if (typeof active === "number") keep = active
-  const activeSet = active instanceof Set ? active : Array.isArray(active) ? new Set(active) : new Set<string>()
   const scored = [...wallets.values()].filter((wallet) => wallet.enrolled)
-  const rank = (wallet: (typeof scored)[number]): [number, number, number, number, string] => [
-    activeSet.has(wallet.address) ? 0 : 1,
+  const rank = (wallet: (typeof scored)[number]): [number, number, number, string] => [
     wallet.persona?.mind === "restless" ? 0 : 1,
     wallet.persona?.tempoWindows ?? 36,
     -wallet.bankroll,
@@ -871,10 +966,10 @@ export function warmKeepAddresses(
     .sort((left, right) => {
       const a = rank(left)
       const b = rank(right)
-      for (let index = 0; index < 4; index++) {
+      for (let index = 0; index < 3; index++) {
         if (a[index]! !== b[index]!) return (a[index] as number) - (b[index] as number)
       }
-      return (a[4] as string).localeCompare(b[4] as string)
+      return a[3].localeCompare(b[3])
     })
     .slice(0, Math.max(0, keep))
     .map((wallet) => wallet.address)
@@ -897,7 +992,7 @@ export function isCoolingError(message: string | null): boolean {
 
 async function bindWallet(wallets: Map<string, LiveWallet>, wallet: LiveWallet, chainId: number, fail: (message: string) => void) {
   if (wallet.token) {
-    const rebound = await callMarket("sign_in", { token: wallet.token })
+    const rebound = await callMarket("sign_in", { token: wallet.token }, 15_000)
     if (rebound.transport) {
       noteTransport(wallets, rebound)
       wallet.nextEnroll = Date.now() + 5_000
@@ -920,12 +1015,16 @@ async function bindWallet(wallets: Map<string, LiveWallet>, wallet: LiveWallet, 
     fail("Enroll failed")
     return
   }
-  const opened = await callMarket("sign_in", {
-    address: wallet.address,
-    signature: signed.signature,
-    issued,
-    ...(signed.nonce ? { nonce: signed.nonce, publicKey: signed.publicKey } : {}),
-  })
+  const opened = await callMarket(
+    "sign_in",
+    {
+      address: wallet.address,
+      signature: signed.signature,
+      issued,
+      ...(signed.nonce ? { nonce: signed.nonce, publicKey: signed.publicKey } : {}),
+    },
+    15_000,
+  )
   if (opened.transport) {
     noteTransport(wallets, opened)
     wallet.nextEnroll = Date.now() + 5_000
@@ -969,12 +1068,23 @@ function hex(bytes: Uint8Array): string {
   return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("")
 }
 
-function noteTransport(wallets: Map<string, LiveWallet>, reply: ToolReply) {
-  if (!reply.transport) return
+function unbindAll(wallets: Map<string, LiveWallet>) {
   for (const wallet of wallets.values()) {
     wallet.bound = false
     wallet.nextEnroll = 0
   }
+}
+
+function noteTransport(wallets: Map<string, LiveWallet>, reply: ToolReply) {
+  if (!reply.transport) return
+  console.error(`market transport lost: ${toolError(reply)}`)
+  unbindAll(wallets)
+}
+
+/** The market connection forgot this account, so every bound wallet is suspect. */
+function isAuthError(message: string): boolean {
+  const lower = message.toLowerCase()
+  return lower.includes("sign in") || lower.includes("signed in") || lower.includes("sign-in") || lower.includes("name the account")
 }
 
 function toolError(reply: ToolReply): string {
@@ -987,7 +1097,7 @@ async function loadBook(
   readCursor: () => number,
   writeCursor: (value: number) => void,
 ): Promise<Book | null> {
-  const live = await callMarket("book", { tailMs: swarmConfig.runner.tapeTailMs })
+  const live = await callMarket("book", { tailMs: swarmConfig.runner.tapeTailMs }, 15_000)
   if (live.transport) {
     noteTransport(wallets, live)
     return null
@@ -995,10 +1105,15 @@ async function loadBook(
   if (!live.ok) return null
   const board = liveBook(live.body)
   if (!board) return null
+  // A fresh local DB has no stakes and no cursor. Start replay at the current
+  // clock instead of walking every settled round the market has ever produced.
+  if (readCursor() <= 0 && board.joinId >= 0 && minStakeRoundAfter(db, 0) === null) {
+    writeCursor(board.joinId - 1)
+  }
   const settled: Book["settled"] = []
   let scan = readCursor()
   for (;;) {
-    const page = await callMarket("rounds", { limit: 100, after: scan })
+    const page = await callMarket("rounds", { limit: 100, after: scan }, 15_000)
     if (page.transport) {
       noteTransport(wallets, page)
       break
@@ -1012,7 +1127,7 @@ async function loadBook(
     scan = last.id
     if (rows.length < 100) break
   }
-  const recentPage = await callMarket("rounds", { limit: 8 })
+  const recentPage = await callMarket("rounds", { limit: 8 }, 15_000)
   if (recentPage.transport) noteTransport(wallets, recentPage)
   const recent = recentPage.ok ? (recentRounds(recentPage.body) ?? []) : []
   const book: Book = { ...board, settled, recent }
@@ -1066,30 +1181,56 @@ async function postOrders(
   wallets: Map<string, LiveWallet>,
   flow: FlowFile,
   fail: (message: string) => void,
-): Promise<{ done: boolean; count: number; up: number; down: number; stakes: number[] }> {
+): Promise<{
+  done: boolean
+  count: number
+  up: number
+  down: number
+  stakes: number[]
+  attempted: number
+  rejected: number
+  lastReject: string | null
+}> {
   let count = 0
   let up = 0
   let down = 0
+  let attempted = 0
+  let rejected = 0
+  let lastReject: string | null = null
   const stakes: number[] = []
   const accepted: { address: string; side: Side; stakeMicros: number }[] = []
   while (pending.sent < pending.orders.length) {
-    if (Date.now() >= pending.endsAt - 150) return { done: false, count, up, down, stakes }
+    if (Date.now() >= pending.endsAt - swarmConfig.timing.marginMs) {
+      return { done: false, count, up, down, stakes, attempted, rejected, lastReject }
+    }
     const part = pending.orders.slice(pending.sent, pending.sent + swarmConfig.runner.betChunk)
-    const response = await callMarket("place_buy_ins", { orders: part, roundId: pending.roundId })
+    const response = await callMarket("place_buy_ins", { orders: part, roundId: pending.roundId }, 15_000)
     if (response.transport) noteTransport(wallets, response)
     const results = Array.isArray(response.body.results)
-      ? (response.body.results as { address?: unknown; ok?: unknown; balanceMicros?: unknown }[])
+      ? (response.body.results as { address?: unknown; ok?: unknown; balanceMicros?: unknown; error?: unknown }[])
       : null
+    attempted += part.length
     if (!response.ok || !results) {
       const error = typeof response.body.error === "string" ? response.body.error : "Buy-in chunk failed"
+      rejected += part.length
+      lastReject = error
       fail(error)
-      if (response.body.code === "late" || error === "Buy-in is closed" || error === "Price feed is delayed") {
-        return { done: true, count, up, down, stakes }
+      if (isAuthError(error)) {
+        unbindAll(wallets)
+        return { done: true, count, up, down, stakes, attempted, rejected, lastReject }
       }
-      return { done: false, count, up, down, stakes }
+      if (response.body.code === "late" || error === "Buy-in is closed" || error === "Price feed is delayed") {
+        return { done: true, count, up, down, stakes, attempted, rejected, lastReject }
+      }
+      return { done: false, count, up, down, stakes, attempted, rejected, lastReject }
     }
     for (const result of results) {
-      if (result.ok !== true || typeof result.address !== "string") continue
+      if (result.ok !== true) {
+        rejected += 1
+        if (typeof result.error === "string" && result.error) lastReject = result.error
+        continue
+      }
+      if (typeof result.address !== "string") continue
       const order = part.find((item) => item.address === result.address)
       const wallet = wallets.get(result.address)
       if (!order || !wallet) continue
@@ -1108,7 +1249,7 @@ async function postOrders(
     pending.sent += part.length
   }
   if (accepted.length > 0) saveStakes(db, pending.roundId, accepted)
-  return { done: true, count, up, down, stakes }
+  return { done: true, count, up, down, stakes, attempted, rejected, lastReject }
 }
 
 async function audit(wallets: Map<string, LiveWallet>, cursor: number, setCursor: (value: number) => void) {
@@ -1128,6 +1269,11 @@ async function audit(wallets: Map<string, LiveWallet>, cursor: number, setCursor
     if (response.ok && response.body.address === wallet.address && typeof response.body.balanceMicros === "number") {
       wallet.bankroll = response.body.balanceMicros
       wallet.dirty = true
+      return
+    }
+    if (isAuthError(toolError(response))) {
+      unbindAll(wallets)
+      dropped = true
     }
   })
   const next = start + slice.length
@@ -1162,7 +1308,12 @@ async function bankPass(wallets: Map<string, LiveWallet>, flow: FlowFile, fail: 
       continue
     }
     if (!response.ok || typeof response.body.balanceMicros !== "number") {
-      fail(typeof response.body.error === "string" ? response.body.error : "Withdrawal failed")
+      const error = typeof response.body.error === "string" ? response.body.error : "Withdrawal failed"
+      fail(error)
+      if (isAuthError(error)) {
+        unbindAll(wallets)
+        return
+      }
       continue
     }
     wallet.bankroll = response.body.balanceMicros
@@ -1224,7 +1375,17 @@ function buildSnapshot(input: {
   arrivedMinute: number
   leftMinute: number
   trace: number[]
-  windowStats: { roundId: number | null; buyIns: number; skips: number; up: number; down: number; stakes: number[] }
+  windowStats: {
+    roundId: number | null
+    buyIns: number
+    skips: number
+    up: number
+    down: number
+    stakes: number[]
+    attempted: number
+    rejected: number
+    lastReject: string | null
+  }
   running: boolean
 }): SwarmSnapshot {
   const steered = steering()
@@ -1240,6 +1401,7 @@ function buildSnapshot(input: {
     window: view ? [view.window[0], view.window[1]] : [0, 0],
     online: input.running ? walletsOnline(input.wallets) : 0,
     enrolled: walletsEnrolled(input.wallets),
+    bound: input.running ? walletsBound(input.wallets) : 0,
     pid: input.running ? process.pid : null,
     running: input.running,
     spring: input.director.value,
@@ -1255,6 +1417,9 @@ function buildSnapshot(input: {
       botDownMicros: input.windowStats.down,
       buyIns: input.windowStats.buyIns,
       skips: input.windowStats.skips,
+      attempted: input.windowStats.attempted,
+      rejected: input.windowStats.rejected,
+      lastReject: input.windowStats.lastReject,
       p50: stakes.p50,
       p90: stakes.p90,
     },
@@ -1279,6 +1444,12 @@ function walletsOnline(wallets: Map<string, LiveWallet>): number {
 function walletsEnrolled(wallets: Map<string, LiveWallet>): number {
   let count = 0
   for (const wallet of wallets.values()) if (wallet.enrolled) count += 1
+  return count
+}
+
+function walletsBound(wallets: Map<string, LiveWallet>): number {
+  let count = 0
+  for (const wallet of wallets.values()) if (wallet.enrolled && wallet.bound) count += 1
   return count
 }
 
@@ -1393,6 +1564,7 @@ export function mergeLanes(rows: SwarmSnapshot[]): SwarmSnapshot {
   }
   const errors = rows.map((row) => row.lastError).filter((item): item is string => Boolean(item))
   const lags = rows.map((row) => row.bookLagMs).filter((item): item is number => typeof item === "number")
+  const lastReject = rows.map((row) => row.book.lastReject).find((item): item is string => Boolean(item)) ?? null
   return {
     ...newest,
     at: newest.at,
@@ -1402,6 +1574,7 @@ export function mergeLanes(rows: SwarmSnapshot[]): SwarmSnapshot {
     ],
     online: rows.reduce((sum, row) => sum + row.online, 0),
     enrolled: rows.reduce((sum, row) => sum + (row.enrolled ?? 0), 0),
+    bound: rows.reduce((sum, row) => sum + (row.bound ?? 0), 0),
     arrivedMinute: rows.reduce((sum, row) => sum + row.arrivedMinute, 0),
     leftMinute: rows.reduce((sum, row) => sum + row.leftMinute, 0),
     target: rows.reduce((sum, row) => sum + row.target, 0),
@@ -1416,6 +1589,9 @@ export function mergeLanes(rows: SwarmSnapshot[]): SwarmSnapshot {
       botDownMicros: rows.reduce((sum, row) => sum + row.book.botDownMicros, 0),
       buyIns: rows.reduce((sum, row) => sum + row.book.buyIns, 0),
       skips: rows.reduce((sum, row) => sum + row.book.skips, 0),
+      attempted: rows.reduce((sum, row) => sum + (row.book.attempted ?? 0), 0),
+      rejected: rows.reduce((sum, row) => sum + (row.book.rejected ?? 0), 0),
+      lastReject,
     },
     money: {
       seedMicros: rows.reduce((sum, row) => sum + row.money.seedMicros, 0),

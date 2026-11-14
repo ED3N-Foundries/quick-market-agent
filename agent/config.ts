@@ -137,6 +137,11 @@ export type RunnerConfig = {
   enrollGapMs: number
   rampEnrollWidth: number
   rampEnrollGapMs: number
+  repairWidth: number
+  repairGapMs: number
+  seedCount: number
+  cleanupEveryMs: number
+  stakeRetentionRounds: number
 }
 
 export type TimingConfig = {
@@ -310,6 +315,11 @@ const runnerSchema = z.strictObject({
   enrollGapMs: z.number(),
   rampEnrollWidth: z.number(),
   rampEnrollGapMs: z.number(),
+  repairWidth: z.number(),
+  repairGapMs: z.number(),
+  seedCount: z.number(),
+  cleanupEveryMs: z.number(),
+  stakeRetentionRounds: z.number(),
 })
 
 const timingSchema = z.strictObject({
@@ -458,8 +468,8 @@ const swarmInput: SwarmConfig = {
     enrollWidth: 32,
     betChunk: 200,
     orderCap: 800,
-    auditSlice: 200,
-    auditEveryMs: 4_000,
+    auditSlice: 50,
+    auditEveryMs: 10_000,
     bankEveryMs: 5_000,
     snapshotEveryMs: 250,
     tapeTailMs: 90_000,
@@ -468,6 +478,11 @@ const swarmInput: SwarmConfig = {
     enrollGapMs: 1_000,
     rampEnrollWidth: 5,
     rampEnrollGapMs: 8_000,
+    repairWidth: 32,
+    repairGapMs: 250,
+    seedCount: 20,
+    cleanupEveryMs: 60_000,
+    stakeRetentionRounds: 2_000,
   },
   timing: {
     historyWindows: 4,
@@ -477,7 +492,7 @@ const swarmInput: SwarmConfig = {
     signalScale: 1.2,
     priceGain: 0.01,
     virtualMicros: 10 * USDC,
-    marginMs: 400,
+    marginMs: 1_000,
     sliceMs: 350,
     waveCap: 80,
     lossScaleMin: 0.35,
@@ -563,6 +578,12 @@ export function checkConfig(config: SwarmConfig): string | null {
   if (!(config.runner.enrollGapMs > 0)) return "Enroll gap must be positive"
   if (!(config.runner.rampEnrollWidth >= 1)) return "Ramp enroll width must be positive"
   if (!(config.runner.rampEnrollGapMs > 0)) return "Ramp enroll gap must be positive"
+  if (!(config.runner.repairWidth >= 1)) return "Repair width must be positive"
+  if (!(config.runner.repairGapMs > 0)) return "Repair gap must be positive"
+  if (!(config.runner.seedCount >= 1)) return "Seed count must be positive"
+  if (config.runner.seedCount > config.runner.keyCap) return "Seed count sits above the key cap"
+  if (!(config.runner.cleanupEveryMs > 0)) return "Cleanup interval must be positive"
+  if (!(config.runner.stakeRetentionRounds >= 100)) return "Stake retention is too short"
 
   const { timing } = config
   if (timing.historyWindows < 1) return "History needs a window"

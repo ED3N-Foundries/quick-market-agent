@@ -11,7 +11,10 @@ COPY <<'ENTRYEOF' /agent-entrypoint.sh
 #!/bin/sh
 set -u
 mkdir -p /data/agent
-chown bun:bun /data /data/agent
+if [ ! -f /data/agent/control.json ]; then
+  cp /app/agent/control.json /data/agent/control.json
+fi
+chown bun:bun /data /data/agent /data/agent/control.json
 cd /data
 
 stop=0

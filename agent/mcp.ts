@@ -34,6 +34,26 @@ type Session = {
   opening: Promise<void> | null
 }
 
+/** A stalled MCP request must not freeze a lane or leave the enrollment latch stuck. */
+const CALL_TIMEOUT_MS = 5_000
+
+function withTimeout<T>(work: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`Market call timed out after ${ms}ms`)), ms)
+    timer.unref?.()
+    work.then(
+      (value) => {
+        clearTimeout(timer)
+        resolve(value)
+      },
+      (error: unknown) => {
+        clearTimeout(timer)
+        reject(error)
+      },
+    )
+  })
+}
+
 const sessions = new Map<string, Session>()
 
 function sessionFor(chain: string): Session {
@@ -120,27 +140,34 @@ export async function openMarket(apiUrl: string, chain: string): Promise<void> {
   await reconnect(row)
 }
 
-export async function callMarket(name: string, args: Record<string, unknown>): Promise<ToolReply> {
+export async function callMarket(name: string, args: Record<string, unknown>, timeoutMs = CALL_TIMEOUT_MS): Promise<ToolReply> {
   const row = sessionFor(activeChainKey())
   try {
-    return await once(row, name, args)
+    return await once(row, name, args, timeoutMs)
   } catch (error) {
-    try {
-      await reconnect(row)
-    } catch {
-      // The next wave rebinds after the caller sees transport: true.
+    const reason = error instanceof Error ? error.message : "The book is unreachable"
+    // A slow call is not a lost session. Reconnecting closes every in-flight
+    // request and forces a 9k-wallet rebind, which is much worse than retrying.
+    const timedOut = /timed out/i.test(reason)
+    if (!timedOut) {
+      console.error(`market ${name} transport: ${reason}`)
+      try {
+        await reconnect(row)
+      } catch {
+        // The next wave rebinds after the caller sees transport: true.
+      }
     }
     return {
       ok: false,
-      body: { error: error instanceof Error ? error.message : "The book is unreachable" },
-      transport: true,
+      body: { error: `${name}: ${reason}` },
+      transport: !timedOut,
     }
   }
 }
 
-async function once(row: Session, name: string, args: Record<string, unknown>): Promise<ToolReply> {
+async function once(row: Session, name: string, args: Record<string, unknown>, timeoutMs: number): Promise<ToolReply> {
   const current = await currentClient(row)
-  const result = (await current.callTool({ name, arguments: args })) as ToolContent
+  const result = (await withTimeout(current.callTool({ name, arguments: args }), timeoutMs)) as ToolContent
   const text = result.content?.find((item) => item.type === "text")?.text
   if (!text) return { ok: false, body: { error: "The book is unreachable" }, transport: true }
   let body: unknown
@@ -160,7 +187,7 @@ async function reconnect(row: Session): Promise<void> {
   row.opening = (async () => {
     const previous = row.client
     row.client = null
-    await previous?.close().catch(() => undefined)
+    if (previous) await withTimeout(previous.close().catch(() => undefined), CALL_TIMEOUT_MS).catch(() => undefined)
     row.client = await connect(row)
   })()
   try {
@@ -179,6 +206,11 @@ async function currentClient(row: Session): Promise<Client> {
 async function connect(row: Session): Promise<Client> {
   if (!row.endpoint) throw new Error("The book is unreachable")
   const next = new Client({ name: "quick-market-agent", version: "1.0.0" })
-  await next.connect(new StreamableHTTPClientTransport(new URL(row.endpoint)))
-  return next
+  try {
+    await withTimeout(next.connect(new StreamableHTTPClientTransport(new URL(row.endpoint))), CALL_TIMEOUT_MS)
+    return next
+  } catch (error) {
+    await next.close().catch(() => undefined)
+    throw error
+  }
 }
