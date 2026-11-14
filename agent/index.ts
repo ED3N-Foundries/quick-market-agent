@@ -420,23 +420,35 @@ async function trade(share: number): Promise<void> {
         wallet.dirty = true
         leftMinute += 1
       }
+      // Warm keep: richest funded stay online so the book is never empty.
+      // They still need bound + enrolled to trade; this only overrides sleep.
+      for (const address of warmKeepAddresses(wallets, 5)) {
+        const wallet = wallets.get(address)
+        if (!wallet || !wallet.enrolled || !wallet.bound || wallet.online) continue
+        wallet.online = true
+        wallet.wokeAt = now
+        wallet.dirty = true
+        arrivedMinute += 1
+        recent.push({ index: wallet.index, at: now })
+      }
       while (recent.length > 0 && now - recent[0]!.at > swarmConfig.presence.herdWindowMs) recent.shift()
 
       flush()
       const needsSignIn = [...wallets.values()].some((wallet) => wallet.enrolled && !wallet.bound && wallet.nextEnroll <= now)
       const near = activeChainKey() === "near-testnet"
       const enrollGap = near ? swarmConfig.runner.rampEnrollGapMs : swarmConfig.runner.enrollGapMs
+      const coolingNow = isCoolingError(lastError)
       if (
         !enrolling &&
         now >= nextEnrollBatch &&
-        (needsSignIn || enrolledWallets.length < Math.min(swarmConfig.runner.keyCap, Math.ceil(view.online)))
+        (needsSignIn || (!coolingNow && enrolledWallets.length < Math.min(swarmConfig.runner.keyCap, Math.ceil(view.online))))
       ) {
         enrolling = true
         nextEnrollBatch = now + enrollGap
         const enrollWidth = near ? swarmConfig.runner.rampEnrollWidth : swarmConfig.runner.enrollWidth
         void enrollDue(wallets, chain.id, now, Math.ceil(view.online), enrollWidth, flow, (message) => {
           lastError = message
-        }).finally(() => {
+        }, coolingNow).finally(() => {
           enrolling = false
         })
       }
@@ -770,22 +782,50 @@ async function enrollDue(
   enrollWidth: number,
   _flow: FlowFile,
   fail: (message: string) => void,
+  cooling = false,
 ) {
-  const repair = [...wallets.values()].filter((wallet) => wallet.enrolled && !wallet.bound && wallet.nextEnroll <= now)
+  const repair = [...wallets.values()]
+    .filter((wallet) => wallet.enrolled && !wallet.bound && wallet.nextEnroll <= now)
+    .sort((left, right) => right.bankroll - left.bankroll || left.index - right.index)
   const enrolledCount = walletsEnrolled(wallets)
   const needed = Math.max(0, Math.min(swarmConfig.runner.keyCap, wantedOnline) - enrolledCount)
+  // While cooling, never open fresh grants. Repair via stored token is safe (no mint).
   const fresh =
-    needed === 0
+    needed === 0 || cooling
       ? []
       : [...wallets.values()]
           .filter((wallet) => !wallet.enrolled && wallet.nextEnroll <= now)
-          .sort((left, right) => left.index - right.index)
+          .sort((left, right) => right.bankroll - left.bankroll || left.index - right.index)
           .slice(0, Math.min(needed, enrollWidth))
   const due = [...repair, ...fresh].slice(0, enrollWidth)
   if (due.length === 0) return
   await pool(due, enrollWidth, async (wallet) => {
     await bindWallet(wallets, wallet, chainId, fail)
   })
+}
+
+/** Richest funded wallets stay on the field so the book is never empty. */
+export function warmKeepAddresses(wallets: Map<string, { address: string; bankroll: number; enrolled: boolean }>, keep = 5): string[] {
+  return [...wallets.values()]
+    .filter((wallet) => wallet.enrolled)
+    .sort((left, right) => right.bankroll - left.bankroll || (left as { address: string }).address.localeCompare((right as { address: string }).address))
+    .slice(0, Math.max(0, keep))
+    .map((wallet) => wallet.address)
+}
+
+/** Fresh grants pause while the funding plane is cooling or rate-limited. */
+export function isCoolingError(message: string | null): boolean {
+  if (!message) return false
+  const lower = message.toLowerCase()
+  return (
+    lower.includes("near_cooling") ||
+    lower.includes("cooling") ||
+    lower.includes("429") ||
+    lower.includes("503") ||
+    lower.includes("rate-limited") ||
+    lower.includes("rate limited") ||
+    lower.includes("rpc")
+  )
 }
 
 async function bindWallet(wallets: Map<string, LiveWallet>, wallet: LiveWallet, chainId: number, fail: (message: string) => void) {

@@ -1,5 +1,5 @@
-/** Blocks a grant mint must sit before the ledger is credited. Same depth as a deposit. */
-export const MINT_CONFIRMATIONS = 3
+/** Blocks a grant mint must sit before the ledger is credited. One confirmation on both chains. */
+export const MINT_CONFIRMATIONS = 1
 
 /**
  * How long a mint may wait for those blocks.
