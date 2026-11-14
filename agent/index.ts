@@ -151,7 +151,8 @@ async function trade(share: number): Promise<void> {
   let funded: Set<string> | null = null
   if (near) {
     requireNearToken(chain.key, loadEnv().tokenAccount)
-    const treasury = await accountFromSecret(loadEnv().treasuryPrivateKey)
+    const env = loadEnv()
+    const treasury = env.nearTreasuryAccount || (await accountFromSecret(env.treasuryPrivateKey))
     if (!treasury) {
       console.error("NEAR_TREASURY_PRIVATE_KEY must be an ed25519 NEAR secret key")
       process.exit(1)

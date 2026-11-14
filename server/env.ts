@@ -10,6 +10,7 @@ import { seedFromSecret } from "../shared/nearKey"
 /** Secrets and machine settings. Nothing here is hardcoded. */
 export type Env = {
   treasuryPrivateKey: string
+  nearTreasuryAccount: string
   agentSecret: string
   rpcUrl: string
   usdcAddress: string
@@ -24,6 +25,7 @@ export type Env = {
 type EnvSource = {
   TREASURY_PRIVATE_KEY?: string
   NEAR_TREASURY_PRIVATE_KEY?: string
+  NEAR_TREASURY_ACCOUNT?: string
   AGENT_SECRET?: string
   RPC_URL?: string
   USDC_ADDRESS?: string
@@ -64,6 +66,13 @@ export function parseTokenAccount(value: unknown): string {
   return raw
 }
 
+export function parseNearTreasuryAccount(value: unknown): string {
+  const raw = unset(value)
+  if (raw === undefined) return ""
+  if (typeof raw !== "string" || !isNearAccountId(raw)) throw new Error("NEAR_TREASURY_ACCOUNT must be a NEAR account id")
+  return raw
+}
+
 const treasuryKey = z.preprocess((value) => {
   if (typeof value === "string" && (value === "" || value.startsWith("ed25519:") || /^0x[0-9a-fA-F]{64}$/.test(value))) return value
   return parseTreasuryKey(value, activeChainKey())
@@ -78,6 +87,7 @@ const address = z.preprocess((value) => {
 
 const envSchema = z.object({
   treasuryPrivateKey: treasuryKey,
+  nearTreasuryAccount: z.preprocess((value) => parseNearTreasuryAccount(value), z.string()),
   agentSecret: z.preprocess((value) => (typeof value === "string" ? value : ""), z.string()),
   rpcUrl: z.preprocess((value) => {
     const raw = unset(value)
@@ -116,6 +126,7 @@ export function loadEnv(env: EnvSource = process.env): Env {
   const chainKey = activeChainKey()
   return envSchema.parse({
     treasuryPrivateKey: parseTreasuryKey(treasuryEnvValue(chainKey, env), chainKey),
+    nearTreasuryAccount: env.NEAR_TREASURY_ACCOUNT,
     agentSecret: env.AGENT_SECRET,
     rpcUrl: env.RPC_URL,
     usdcAddress: env.USDC_ADDRESS,

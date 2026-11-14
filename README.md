@@ -2,7 +2,12 @@
 
 Swarm runner and terminal dashboard for Quick Market. Split out of
 `ED3N-Foundries/quick-market` on 2026-11-10 so the market repo holds no
-runner code. This repo is private.
+runner code. This repo is public.
+
+For the simplest NEAR Testnet demo, clone this repo beside `quick-market`
+and `quick-market-health`, install each repo, and run `bun run demo` from the
+market repo. That launcher supplies this runner's environment automatically.
+See the [main judge guide](https://github.com/ED3N-Foundries/quick-market#run-the-complete-demo-locally).
 
 One Bun process keeps a crowd of durable wallets whose size glides between a
 few hundred and a few thousand. Each wallet buys in for itself. Surplus over
@@ -52,7 +57,7 @@ session. Inside compose that URL is `http://quick-market:3001/mcp?chain=`.
 - Each wave is `place_buy_ins`, up to 200 orders.
 - Drift is corrected with `account` on the signed-in wallets, in slices.
 - Surplus leaves through `withdraw`, which debits the ledger and pays the wallet.
-- The runner does not call `claim_grant`. A new wallet starts at 0.
+- The runner does not call `claim_grant`. A new wallet's first sign-in takes the normal grant.
 
 ## Layout
 
