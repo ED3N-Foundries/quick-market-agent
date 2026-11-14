@@ -28,6 +28,7 @@ import { peekApiEndpoint, refreshApiEndpoint } from "./endpoint"
 import { histogram, manilaClock, parseControl, parseFlow, percentiles, type FlowFile, type SwarmSnapshot } from "./status"
 import { publishStats, startStatsServer } from "./stats"
 import { CONTROL_PATH, FLOW_PATH, KEYS_PATH, NEAR_KEYS_PATH, STATUS_PATH, SWARM_PATH, readJson, writeJsonAtomic } from "./store"
+import { ACTIVE_KEEP, loadActiveFive } from "./active"
 import {
   loadWalletMap,
   metaGet,
@@ -254,6 +255,19 @@ async function trade(share: number): Promise<void> {
   let windowStats = { roundId: null as number | null, buyIns: 0, skips: 0, up: 0, down: 0, stakes: [] as number[] }
   let lastView: DirectorView | null = null
   let stopping = false
+  let activeFive: string[] = []
+  let lastActiveRefresh = 0
+  const refreshActiveFive = (now: number, force = false) => {
+    if (!force && now - lastActiveRefresh < 60_000 && activeFive.length > 0) return activeFive
+    lastActiveRefresh = now
+    try {
+      activeFive = loadActiveFive(db, now, windowMs(), chainKey, ACTIVE_KEEP)
+    } catch {
+      // keep last known pin on DB errors
+    }
+    return activeFive
+  }
+  refreshActiveFive(Date.now(), true)
 
   const flush = (running = !stopping) => {
     const dirty = [...wallets.values()].filter((wallet) => wallet.dirty && wallet.enrolled).map((wallet) => toRow(wallet))
@@ -420,9 +434,10 @@ async function trade(share: number): Promise<void> {
         wallet.dirty = true
         leftMinute += 1
       }
-      // Warm keep: richest funded stay online so the book is never empty.
+      // Warm keep: weekly most-active stay online so the book is never empty.
       // They still need bound + enrolled to trade; this only overrides sleep.
-      for (const address of warmKeepAddresses(wallets, 5)) {
+      const activeSet = new Set(refreshActiveFive(now))
+      for (const address of warmKeepAddresses(wallets, activeSet, ACTIVE_KEEP)) {
         const wallet = wallets.get(address)
         if (!wallet || !wallet.enrolled || !wallet.bound || wallet.online) continue
         wallet.online = true
@@ -451,7 +466,7 @@ async function trade(share: number): Promise<void> {
         nextEnrollBatch = now + enrollGap
         void enrollDue(wallets, chain.id, now, wantedEnroll, width, flow, (message) => {
           lastError = message
-        }, coolingNow).finally(() => {
+        }, coolingNow, activeSet).finally(() => {
           enrolling = false
         })
       }
@@ -777,6 +792,28 @@ function toRow(wallet: LiveWallet): WalletRow {
   }
 }
 
+function enrollRank(
+  wallet: LiveWallet,
+  active: Set<string>,
+): [number, number, number, number, number] {
+  // Active-five first, then restless (frequent traders), then low tempo,
+  // then richest, then lowest index. Ordering only — width/gap/cooldown unchanged.
+  return [
+    active.has(wallet.address) ? 0 : 1,
+    wallet.persona.mind === "restless" ? 0 : 1,
+    wallet.persona.tempoWindows,
+    -wallet.bankroll,
+    wallet.index,
+  ]
+}
+
+function compareRank(left: [number, number, number, number, number], right: [number, number, number, number, number]): number {
+  for (let index = 0; index < left.length; index++) {
+    if (left[index]! !== right[index]!) return left[index]! - right[index]!
+  }
+  return 0
+}
+
 async function enrollDue(
   wallets: Map<string, LiveWallet>,
   chainId: number,
@@ -786,10 +823,12 @@ async function enrollDue(
   _flow: FlowFile,
   fail: (message: string) => void,
   cooling = false,
+  active: Set<string> = new Set(),
 ) {
+  const rankOf = (wallet: LiveWallet) => enrollRank(wallet, active)
   const repair = [...wallets.values()]
     .filter((wallet) => wallet.enrolled && !wallet.bound && wallet.nextEnroll <= now)
-    .sort((left, right) => right.bankroll - left.bankroll || left.index - right.index)
+    .sort((left, right) => compareRank(rankOf(left), rankOf(right)))
   const enrolledCount = walletsEnrolled(wallets)
   const needed = Math.max(0, Math.min(swarmConfig.runner.keyCap, wantedOnline) - enrolledCount)
   // While cooling, never open fresh grants. Repair via stored token is safe (no mint).
@@ -798,7 +837,7 @@ async function enrollDue(
       ? []
       : [...wallets.values()]
           .filter((wallet) => !wallet.enrolled && wallet.nextEnroll <= now)
-          .sort((left, right) => right.bankroll - left.bankroll || left.index - right.index)
+          .sort((left, right) => compareRank(rankOf(left), rankOf(right)))
           .slice(0, Math.min(needed, enrollWidth))
   const due = [...repair, ...fresh].slice(0, enrollWidth)
   if (due.length === 0) return
@@ -807,11 +846,36 @@ async function enrollDue(
   })
 }
 
-/** Richest funded wallets stay on the field so the book is never empty. */
-export function warmKeepAddresses(wallets: Map<string, { address: string; bankroll: number; enrolled: boolean }>, keep = 5): string[] {
-  return [...wallets.values()]
-    .filter((wallet) => wallet.enrolled)
-    .sort((left, right) => right.bankroll - left.bankroll || (left as { address: string }).address.localeCompare((right as { address: string }).address))
+/**
+ * Dynamic active-five stay on the field so the book is never empty.
+ * Falls back to restless-first ordering when the weekly pin is empty
+ * (fresh deployment), so frequent traders are funded first.
+ */
+export function warmKeepAddresses(
+  wallets: Map<string, { address: string; bankroll: number; enrolled: boolean; persona?: { mind: string; tempoWindows: number }; index?: number }>,
+  active: Set<string> | string[] | number = [],
+  keep = 5,
+): string[] {
+  // Backwards-compat: warmKeepAddresses(wallets, 5) still means keep=5.
+  if (typeof active === "number") keep = active
+  const activeSet = active instanceof Set ? active : Array.isArray(active) ? new Set(active) : new Set<string>()
+  const scored = [...wallets.values()].filter((wallet) => wallet.enrolled)
+  const rank = (wallet: (typeof scored)[number]): [number, number, number, number, string] => [
+    activeSet.has(wallet.address) ? 0 : 1,
+    wallet.persona?.mind === "restless" ? 0 : 1,
+    wallet.persona?.tempoWindows ?? 36,
+    -wallet.bankroll,
+    wallet.address,
+  ]
+  return scored
+    .sort((left, right) => {
+      const a = rank(left)
+      const b = rank(right)
+      for (let index = 0; index < 4; index++) {
+        if (a[index]! !== b[index]!) return (a[index] as number) - (b[index] as number)
+      }
+      return (a[4] as string).localeCompare(b[4] as string)
+    })
     .slice(0, Math.max(0, keep))
     .map((wallet) => wallet.address)
 }

@@ -235,6 +235,21 @@ export function minStakeRoundAfter(db: Database, sinceId: number, chainKey = act
   return row?.min_id ?? null
 }
 
+export type WeeklyTradeStats = { trades: number; volume: number; lastRound: number }
+
+/** Trades in the last week by round. Uses round_id math so it survives the 200-row windows prune. */
+export function weeklyTradeStats(db: Database, minRound: number, chainKey = activeChainKey()): Map<string, WeeklyTradeStats> {
+  const rows = db.query(
+    `SELECT address, COUNT(*) AS trades, COALESCE(SUM(stake_micros), 0) AS volume, MAX(round_id) AS last_round
+     FROM stakes WHERE chain_key = ? AND round_id >= ? GROUP BY address`,
+  ).all(chainKey, minRound) as { address: string; trades: number; volume: number; last_round: number }[]
+  const out = new Map<string, WeeklyTradeStats>()
+  for (const row of rows) {
+    out.set(String(row.address), { trades: Number(row.trades), volume: Number(row.volume), lastRound: Number(row.last_round) })
+  }
+  return out
+}
+
 export function pruneUnenrolled(db: Database, chainKey = activeChainKey()): void {
   db.query("DELETE FROM wallets WHERE chain_key = ? AND enrolled = 0").run(chainKey)
 }
