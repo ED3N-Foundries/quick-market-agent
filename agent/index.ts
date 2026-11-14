@@ -19,6 +19,7 @@ import { callMarket, liveBook, openMarket, recentRounds, settledRounds, type Too
 import { checkConfig, swarmConfig, type TapeStats } from "./config"
 import { admitWallet, decideOpen, freshGate, keptReadyWindow, noteResult, tapeActivity, type GateState, type PrintPoint, type Side } from "./decide"
 import { fireAt, releaseWave, type FireSlot } from "./schedule"
+import { agentOrderLatency } from "./latency"
 import { createDirector, manilaHour, stepDirector, type DirectorState, type DirectorView } from "./director"
 import { growKeys, growNearKeys, type NearStoredKey, type StoredKey } from "./keys"
 import { personaFor, type Persona } from "./persona"
@@ -93,7 +94,7 @@ type LiveWallet = {
 type Pending = {
   roundId: number
   endsAt: number
-  orders: { address: string; side: Side; stakeMicros: number }[]
+  orders: { address: string; side: Side; stakeMicros: number; fireAt: number }[]
   sent: number
 }
 
@@ -583,7 +584,7 @@ async function trade(share: number): Promise<void> {
                 windowStats.skips += 1
                 continue
               }
-              orders.push({ address: wallet.address, side: decision.side, stakeMicros: decision.stakeMicros })
+              orders.push({ address: wallet.address, side: decision.side, stakeMicros: decision.stakeMicros, fireAt: slot.fireAt })
               wave.taken += 1
               if (decision.side === "up") upPool += decision.stakeMicros
               else downPool += decision.stakeMicros
@@ -967,11 +968,20 @@ async function postOrders(
   while (pending.sent < pending.orders.length) {
     if (Date.now() >= pending.endsAt - 150) return { done: false, count, up, down, stakes }
     const part = pending.orders.slice(pending.sent, pending.sent + swarmConfig.runner.betChunk)
-    const response = await callMarket("place_buy_ins", { orders: part, roundId: pending.roundId })
+    const sendAt = Date.now()
+    const started = performance.now()
+    const scheduledMs = Math.max(0, sendAt - Math.min(...part.map((order) => order.fireAt)))
+    const response = await callMarket("place_buy_ins", {
+      orders: part.map(({ address, side, stakeMicros }) => ({ address, side, stakeMicros })),
+      roundId: pending.roundId,
+    })
+    const responseMs = performance.now() - started
     if (response.transport) noteTransport(wallets, response)
     const results = Array.isArray(response.body.results)
       ? (response.body.results as { address?: unknown; ok?: unknown; balanceMicros?: unknown }[])
       : null
+    const acceptedOrders = typeof response.body.accepted === "number" && Number.isFinite(response.body.accepted) ? response.body.accepted : 0
+    agentOrderLatency.note({ scheduledMs, responseMs, acceptedOrders, failed: !response.ok || !results, now: sendAt })
     if (!response.ok || !results) {
       const error = typeof response.body.error === "string" ? response.body.error : "Buy-in chunk failed"
       fail(error)
@@ -1144,6 +1154,7 @@ function buildSnapshot(input: {
     money: { ...input.flow, histogram: histogram(balances) },
     lastError: input.lastError,
     bookLagMs: input.bookAt === null ? null : input.now - input.bookAt,
+    orderLatency: agentOrderLatency.snapshot(input.now),
     buyInPaused: steered.control.buyInPaused,
     bleed: steered.control.bleed,
     mode: steered.pin !== null ? "pin" : steered.control.mode,

@@ -1,3 +1,5 @@
+import type { AgentOrderLatencySnapshot } from "./latency"
+
 export type ControlMode = "clock" | "off-peak" | "peak" | "ramp" | "pin"
 
 export type ControlFile = {
@@ -54,6 +56,7 @@ export type SwarmSnapshot = {
   money: MoneySnap
   lastError: string | null
   bookLagMs: number | null
+  orderLatency?: AgentOrderLatencySnapshot
   buyInPaused: boolean
   bleed: boolean
   mode: string
