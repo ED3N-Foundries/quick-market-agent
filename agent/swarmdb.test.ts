@@ -7,6 +7,7 @@ import {
   loadWalletMap,
   metaGet,
   metaSet,
+  metaSetMany,
   noteWindow,
   openSwarm,
   pruneStakes,
@@ -141,6 +142,40 @@ test("opening an older swarm database adds the session token column", () => {
   const db = openSwarm(path)
   try {
     expect(loadWalletMap(db, "base-sepolia").get("0xabc")).toMatchObject({ bankroll: 42, token: null })
+  } finally {
+    db.close()
+  }
+})
+
+test("a diagnostic meta batch lands in one transaction", () => {
+  const db = openSwarm(":memory:")
+  try {
+    metaSetMany(
+      db,
+      [
+        ["spring", "100"],
+        ["velocity", "2"],
+        ["settle_cursor", "9"],
+        ["trace", "[1,2]"],
+        ["book_join", "9"],
+        ["book_at", "1000"],
+        ["last_error", ""],
+        ["bound", "500"],
+      ],
+      "base-sepolia",
+    )
+    for (const [key, value] of [
+      ["spring", "100"],
+      ["velocity", "2"],
+      ["settle_cursor", "9"],
+      ["trace", "[1,2]"],
+      ["book_join", "9"],
+      ["book_at", "1000"],
+      ["last_error", ""],
+      ["bound", "500"],
+    ]) {
+      expect(metaGet(db, key!, "base-sepolia")).toBe(value!)
+    }
   } finally {
     db.close()
   }

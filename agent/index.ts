@@ -32,6 +32,7 @@ import {
   loadWalletMap,
   metaGet,
   metaSet,
+  metaSetMany,
   minStakeRoundAfter,
   noteWindow,
   openSwarm,
@@ -279,19 +280,22 @@ async function trade(share: number): Promise<void> {
   }
   let lastView: DirectorView | null = null
   let stopping = false
+  let flushAt = 0
 
   const flush = (running = !stopping) => {
     const dirty = [...wallets.values()].filter((wallet) => wallet.dirty && wallet.enrolled).map((wallet) => toRow(wallet))
     saveWallets(db, dirty)
     for (const wallet of wallets.values()) if (wallet.enrolled) wallet.dirty = false
-    metaSet(db, "spring", String(director.value))
-    metaSet(db, "velocity", String(director.velocity))
-    metaSet(db, "settle_cursor", String(cursor))
-    metaSet(db, "trace", JSON.stringify(trace.slice(-180)))
-    metaSet(db, "book_join", String(book?.joinId ?? -1))
-    metaSet(db, "book_at", String(bookAt ?? 0))
-    metaSet(db, "last_error", lastError ?? "")
-    metaSet(db, "bound", String(walletsBound(wallets)))
+    metaSetMany(db, [
+      ["spring", String(director.value)],
+      ["velocity", String(director.velocity)],
+      ["settle_cursor", String(cursor)],
+      ["trace", JSON.stringify(trace.slice(-180))],
+      ["book_join", String(book?.joinId ?? -1)],
+      ["book_at", String(bookAt ?? 0)],
+      ["last_error", lastError ?? ""],
+      ["bound", String(walletsBound(wallets))],
+    ])
     const snapshot = buildSnapshot({
       now: Date.now(),
       view: lastView,
@@ -308,6 +312,13 @@ async function trade(share: number): Promise<void> {
       running,
     })
     publishLane(activeChainKey(), snapshot, flow)
+  }
+
+  /** The loop wakes four times a second; the ledger and status files do not. */
+  const maybeFlush = (now: number, running = !stopping) => {
+    if (now - flushAt < 1_000) return
+    flushAt = now
+    flush(running)
   }
 
   const takeBook = (): Promise<Book | null> =>
@@ -462,7 +473,7 @@ async function trade(share: number): Promise<void> {
       }
       while (recent.length > 0 && now - recent[0]!.at > swarmConfig.presence.herdWindowMs) recent.shift()
 
-      flush()
+      maybeFlush(now)
       const needsRepair = [...wallets.values()].some((wallet) => wallet.enrolled && !wallet.bound && wallet.nextEnroll <= now)
       const near = activeChainKey() === "near-testnet"
       const coolingNow = isCoolingError(lastError)
@@ -733,7 +744,7 @@ async function trade(share: number): Promise<void> {
     }
     void refreshApiEndpoint(loadEnv().apiUrl).catch(() => undefined)
     try {
-      flush()
+      maybeFlush(Date.now())
     } catch (error) {
       lastError = error instanceof Error ? error.message : "Snapshot write failed"
     }
@@ -873,13 +884,16 @@ function compareRank(left: readonly number[], right: readonly number[]): number 
 
 let resumeSessionsUnsupported = false
 
+/** A smaller batch keeps one resume_sessions call inside the 30s deadline. */
+const RESUME_CHUNK = 500
+
 /** Re-establish stored sessions in a handful of calls instead of one per wallet. */
 async function resumeSessions(wallets: Map<string, LiveWallet>, fail: (message: string) => void): Promise<void> {
   if (resumeSessionsUnsupported) return
   const waiting = [...wallets.values()].filter((wallet) => wallet.enrolled && !wallet.bound && wallet.token)
   if (waiting.length === 0) return
   console.error(`resume_sessions: ${waiting.length} wallets waiting`)
-  const chunk = 1_000
+  const chunk = RESUME_CHUNK
   for (let index = 0; index < waiting.length; index += chunk) {
     const batch = waiting.slice(index, index + chunk)
     const tokens = batch.flatMap((wallet) => (wallet.token ? [wallet.token] : []))
@@ -911,10 +925,10 @@ async function resumeSessions(wallets: Map<string, LiveWallet>, fail: (message: 
 }
 
 /** Do not hammer the market with the same failing batch every tick. */
-function backOffRepair(wallets: readonly LiveWallet[]) {
+function backOffRepair(wallets: Iterable<LiveWallet>) {
   const until = Date.now() + 5_000
   for (const wallet of wallets) {
-    if (!wallet.bound) wallet.nextEnroll = until
+    if (!wallet.bound) wallet.nextEnroll = Math.max(wallet.nextEnroll, until)
   }
 }
 
@@ -1068,6 +1082,7 @@ function hex(bytes: Uint8Array): string {
   return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("")
 }
 
+/** Only a new MCP session invalidates every account binding on the lane. */
 function unbindAll(wallets: Map<string, LiveWallet>) {
   for (const wallet of wallets.values()) {
     wallet.bound = false
@@ -1075,16 +1090,37 @@ function unbindAll(wallets: Map<string, LiveWallet>) {
   }
 }
 
-function noteTransport(wallets: Map<string, LiveWallet>, reply: ToolReply) {
-  if (!reply.transport) return
-  console.error(`market transport lost: ${toolError(reply)}`)
-  unbindAll(wallets)
+/** A real auth failure is scoped to the wallet that received it. */
+function unbindWallet(wallet: LiveWallet | undefined, now = Date.now()) {
+  if (!wallet) return
+  wallet.bound = false
+  wallet.nextEnroll = now + 5_000
 }
 
-/** The market connection forgot this account, so every bound wallet is suspect. */
-function isAuthError(message: string): boolean {
-  const lower = message.toLowerCase()
-  return lower.includes("sign in") || lower.includes("signed in") || lower.includes("sign-in") || lower.includes("name the account")
+/** A transport failure without a new MCP session keeps every binding. */
+export function transportAction(reply: ToolReply): "none" | "backoff" | "unbind" {
+  if (!reply.transport) return "none"
+  return reply.sessionLost ? "unbind" : "backoff"
+}
+
+function noteTransport(wallets: Map<string, LiveWallet>, reply: ToolReply) {
+  if (!reply.transport) return
+  const message = toolError(reply)
+  console.error(`market transport lost: ${message}`)
+  if (transportAction(reply) === "unbind") {
+    // The old MCP session is gone, which is what a market restart looks like.
+    // Stored tokens stay on the wallets; resume_sessions re-establishes them.
+    unbindAll(wallets)
+    return
+  }
+  // A network error keeps tokens and bindings. Back the repair batch off
+  // instead of unbinding thousands of wallets and starting a resume storm.
+  backOffRepair(wallets.values())
+}
+
+/** The market connection forgot this account, so only this wallet is suspect. */
+export function isAuthError(message: string): boolean {
+  return /^(sign in first|sign in on this market|name the account)$/i.test(message.trim())
 }
 
 function toolError(reply: ToolReply): string {
@@ -1216,7 +1252,7 @@ async function postOrders(
       lastReject = error
       fail(error)
       if (isAuthError(error)) {
-        unbindAll(wallets)
+        for (const order of part) unbindWallet(wallets.get(order.address))
         return { done: true, count, up, down, stakes, attempted, rejected, lastReject }
       }
       if (response.body.code === "late" || error === "Buy-in is closed" || error === "Price feed is delayed") {
@@ -1272,8 +1308,7 @@ async function audit(wallets: Map<string, LiveWallet>, cursor: number, setCursor
       return
     }
     if (isAuthError(toolError(response))) {
-      unbindAll(wallets)
-      dropped = true
+      unbindWallet(wallet)
     }
   })
   const next = start + slice.length
@@ -1311,8 +1346,8 @@ async function bankPass(wallets: Map<string, LiveWallet>, flow: FlowFile, fail: 
       const error = typeof response.body.error === "string" ? response.body.error : "Withdrawal failed"
       fail(error)
       if (isAuthError(error)) {
-        unbindAll(wallets)
-        return
+        unbindWallet(wallet)
+        continue
       }
       continue
     }

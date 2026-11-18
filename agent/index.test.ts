@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test"
 import { readFileSync } from "node:fs"
 import { createDirector } from "./director"
-import { mergeLanes, scaleCrowd } from "./index"
+import { isAuthError, mergeLanes, scaleCrowd, transportAction } from "./index"
 import type { SwarmSnapshot } from "./status"
 
 test("a split scales one crowd across the two markets", () => {
@@ -91,4 +91,20 @@ test("the runner does not keep the faucet loop", () => {
   expect(source).not.toContain("requestFaucet")
   expect(source).not.toContain("balanceOf")
   expect(source).not.toContain("data/quick-market.sqlite")
+})
+
+test("transient transport errors keep bindings and only a lost session unbinds", () => {
+  expect(transportAction({ ok: false, body: {}, transport: false })).toBe("none")
+  expect(transportAction({ ok: false, body: { error: "getaddrinfo ENOTFOUND quick-market" }, transport: true })).toBe("backoff")
+  expect(transportAction({ ok: false, body: { error: "ECONNREFUSED" }, transport: true })).toBe("backoff")
+  expect(transportAction({ ok: false, body: { error: "Market call timed out after 15000ms" }, transport: true })).toBe("backoff")
+  expect(transportAction({ ok: false, body: { error: "Session not found" }, transport: true, sessionLost: true })).toBe("unbind")
+})
+
+test("only the market's exact auth messages are wallet auth failures", () => {
+  expect(isAuthError("Sign in on this market")).toBe(true)
+  expect(isAuthError("Sign in first")).toBe(true)
+  expect(isAuthError("Name the account")).toBe(true)
+  expect(isAuthError("market transport lost: sign in timed out")).toBe(false)
+  expect(isAuthError("Price feed is delayed")).toBe(false)
 })

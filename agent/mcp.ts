@@ -4,7 +4,7 @@ import { activeChainKey } from "../server/activeChain"
 
 export type ToolBody = Record<string, unknown>
 
-export type ToolReply = { ok: boolean; body: ToolBody; transport: boolean }
+export type ToolReply = { ok: boolean; body: ToolBody; transport: boolean; sessionLost?: boolean }
 
 export type LiveBook = {
   joinId: number
@@ -149,10 +149,14 @@ export async function callMarket(name: string, args: Record<string, unknown>, ti
     // A slow call is not a lost session. Reconnecting closes every in-flight
     // request and forces a 9k-wallet rebind, which is much worse than retrying.
     const timedOut = /timed out/i.test(reason)
+    let sessionLost = false
     if (!timedOut) {
       console.error(`market ${name} transport: ${reason}`)
       try {
         await reconnect(row)
+        // A successful reconnect is a new MCP session with an empty account
+        // map. Transient errors that never reconnect keep their bindings.
+        sessionLost = true
       } catch {
         // The next wave rebinds after the caller sees transport: true.
       }
@@ -161,6 +165,7 @@ export async function callMarket(name: string, args: Record<string, unknown>, ti
       ok: false,
       body: { error: `${name}: ${reason}` },
       transport: !timedOut,
+      ...(sessionLost ? { sessionLost: true } : {}),
     }
   }
 }

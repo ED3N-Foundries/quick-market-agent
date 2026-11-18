@@ -123,6 +123,15 @@ export function metaSet(db: Database, key: string, value: string, chainKey = act
   ).run(agentMetaKey(key, chainKey), value)
 }
 
+/** One transaction for a diagnostic batch, instead of one autocommit per key. */
+export function metaSetMany(db: Database, entries: readonly (readonly [string, string])[], chainKey = activeChainKey()) {
+  if (entries.length === 0) return
+  const tx = db.transaction(() => {
+    for (const [key, value] of entries) metaSet(db, key, value, chainKey)
+  })
+  tx()
+}
+
 export function loadWalletMap(db: Database, chainKey = activeChainKey()): Map<string, WalletRow> {
   const rows = db.query("SELECT * FROM wallets WHERE chain_key = ?").all(chainKey) as Record<string, unknown>[]
   const map = new Map<string, WalletRow>()
