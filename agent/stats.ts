@@ -63,6 +63,9 @@ export type AgentHealthLive = {
   /** Wallet rows the latest flush found dirty, and the rows it wrote back. */
   dirtyWallets: number
   flushedWallets: number
+  /** Cosmetic rows (presence/gate/skip) the latest cosmetic flush found and wrote. */
+  cosmeticWallets: number
+  cosmeticFlushed: number
   onlineAvg: number | null
   skipRate: number | null
 }
@@ -161,6 +164,8 @@ export function statsBody(snapshot: SwarmSnapshot | null = latest): AgentHealthB
     walBytes: finite(snapshot.walBytes ?? 0),
     dirtyWallets: finite(snapshot.dirtyWallets ?? 0),
     flushedWallets: finite(snapshot.flushedWallets ?? 0),
+    cosmeticWallets: finite(snapshot.cosmeticWallets ?? 0),
+    cosmeticFlushed: finite(snapshot.cosmeticFlushed ?? 0),
     onlineAvg: onlineAverage(trace),
     skipRate: skipRate(book.buyIns, book.skips),
   }

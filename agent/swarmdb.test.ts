@@ -13,9 +13,11 @@ import {
   openSwarm,
   pruneStakes,
   resetWindowEpoch,
+  saveCosmetics,
   saveStakes,
   saveWallets,
   stakesFor,
+  type CosmeticWalletRow,
   type WalletRow,
 } from "./swarmdb"
 
@@ -229,5 +231,51 @@ test("tuneDatabase defaults keep the market settings and memory DBs skip WAL", (
     expect((memory.query("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode).toBe("memory")
   } finally {
     memory.close()
+  }
+})
+
+function cosmetic(address: string, online: number, lastSkip: string | null): CosmeticWalletRow {
+  return {
+    address,
+    online,
+    lastSkip,
+    rngA: 7,
+    gateJson: '{"rngA":7}',
+    cursor: 11,
+    visitStart: 10,
+    visitEnd: 20,
+    gapEnd: 30,
+    wokeAt: 99,
+    sleptAt: null,
+    updatedAt: 100,
+  }
+}
+
+test("cosmetic persistence updates only the cosmetic columns and never inserts", () => {
+  const db = openSwarm(":memory:")
+  try {
+    saveWallets(db, [wallet("0xabc", 100)], "base-sepolia")
+    saveCosmetics(db, [cosmetic("0xabc", 0, "flat")], "base-sepolia")
+    const row = loadWalletMap(db, "base-sepolia").get("0xabc")
+    expect(row?.online).toBe(0)
+    expect(row?.lastSkip).toBe("flat")
+    expect(row?.gateJson).toBe('{"rngA":7}')
+    expect(row?.cursor).toBe(11)
+    expect(row?.wokeAt).toBe(99)
+    // Critical columns never pass through the cosmetic path.
+    expect(row?.bankroll).toBe(100)
+    expect(row?.enrolled).toBe(1)
+    expect(row?.handled).toBe(0)
+
+    // A cosmetic row for a wallet with no stored row is a no-op, not an insert.
+    saveCosmetics(db, [cosmetic("0xghost", 1, "waiting")], "base-sepolia")
+    expect(loadWalletMap(db, "base-sepolia").get("0xghost")).toBeUndefined()
+
+    // The critical full-row write still carries the cosmetic columns with it.
+    const saved = wallet("0xabc", 250)
+    saveWallets(db, [saved], "base-sepolia")
+    expect(loadWalletMap(db, "base-sepolia").get("0xabc")?.bankroll).toBe(250)
+  } finally {
+    db.close()
   }
 })

@@ -206,6 +206,56 @@ export function saveWallets(db: Database, rows: WalletRow[], chainKey = activeCh
   tx()
 }
 
+export type CosmeticWalletRow = {
+  address: string
+  online: number
+  lastSkip: string | null
+  rngA: number
+  gateJson: string
+  cursor: number
+  visitStart: number
+  visitEnd: number
+  gapEnd: number
+  wokeAt: number | null
+  sleptAt: number | null
+  updatedAt: number
+}
+
+/** P1-4 item 4: cosmetic persistence. Presence, gate, and skip columns batch
+ *  on a slow cadence; the critical columns (bankroll, enrolled, handled,
+ *  token, wins/losses, last side/stake) never pass through here. UPDATE-only
+ *  by design — a cosmetic row for a wallet that was never written is a no-op,
+ *  because the critical flush inserts the full row at enrollment. */
+export function saveCosmetics(db: Database, rows: CosmeticWalletRow[], chainKey = activeChainKey()) {
+  if (rows.length === 0) return
+  const tx = db.transaction(() => {
+    const statement = db.query(
+      `UPDATE wallets SET
+         online = ?, last_skip = ?, rng_a = ?, gate_json = ?, cursor = ?, visit_start = ?, visit_end = ?, gap_end = ?,
+         woke_at = ?, slept_at = ?, updated_at = ?
+       WHERE chain_key = ? AND address = ?`,
+    )
+    for (const row of rows) {
+      statement.run(
+        row.online,
+        row.lastSkip,
+        row.rngA,
+        row.gateJson,
+        row.cursor,
+        row.visitStart,
+        row.visitEnd,
+        row.gapEnd,
+        row.wokeAt,
+        row.sleptAt,
+        row.updatedAt,
+        chainKey,
+        row.address,
+      )
+    }
+  })
+  tx()
+}
+
 export function noteWindow(
   db: Database,
   row: { id: number; buyIns: number; skips: number; upMicros: number; downMicros: number; at: number },

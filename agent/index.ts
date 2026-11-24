@@ -40,9 +40,11 @@ import {
   pruneStakes,
   pruneUnenrolled,
   resetWindowEpoch,
+  saveCosmetics,
   saveStakes,
   saveWallets,
   stakesFor,
+  type CosmeticWalletRow,
   type WalletRow,
 } from "./swarmdb"
 
@@ -92,6 +94,7 @@ type LiveWallet = {
   token: string | null
   bound: boolean
   dirty: boolean
+  cosmeticDirty: boolean
 }
 
 type Pending = {
@@ -295,7 +298,12 @@ async function trade(share: number): Promise<void> {
     }
     const flushedWallets = dirty.length
     saveWallets(db, dirty)
-    for (const wallet of wallets.values()) if (wallet.enrolled) wallet.dirty = false
+    // A full-row write persists the cosmetic columns too, so both flags clear.
+    for (const wallet of wallets.values()) {
+      if (!wallet.enrolled) continue
+      if (wallet.dirty) wallet.cosmeticDirty = false
+      wallet.dirty = false
+    }
     metaSetMany(db, [
       ["spring", String(director.value)],
       ["velocity", String(director.velocity)],
@@ -328,6 +336,8 @@ async function trade(share: number): Promise<void> {
       windowStats,
       dirtyWallets,
       flushedWallets,
+      cosmeticWallets,
+      cosmeticFlushed,
       writeBytesPerMin,
       dbBytes: sizes.dbBytes,
       walBytes: sizes.walBytes,
@@ -336,11 +346,35 @@ async function trade(share: number): Promise<void> {
     publishLane(activeChainKey(), snapshot, flow)
   }
 
+  /** Cosmetic persistence batches at a slower cadence: presence, gate, and
+   *  skip diagnostics can lag a few seconds; bankroll and enrollment cannot. */
+  const flushCosmetics = () => {
+    let cosmeticWallets = 0
+    const rows: CosmeticWalletRow[] = []
+    for (const wallet of wallets.values()) {
+      if (!wallet.cosmeticDirty) continue
+      cosmeticWallets += 1
+      if (wallet.enrolled) rows.push(cosmeticRow(wallet))
+    }
+    saveCosmetics(db, rows)
+    for (const wallet of wallets.values()) if (wallet.enrolled) wallet.cosmeticDirty = false
+    return { wallets: cosmeticWallets, flushed: rows.length }
+  }
+  let cosmeticAt = 0
+  let cosmeticWallets = 0
+  let cosmeticFlushed = 0
+
   /** The loop wakes four times a second; the ledger and status files do not. */
   const maybeFlush = (now: number, running = !stopping) => {
     if (now - flushAt < 1_000) return
     flushAt = now
     flush(running)
+    if (now - cosmeticAt >= COSMETIC_FLUSH_MS) {
+      cosmeticAt = now
+      const done = flushCosmetics()
+      cosmeticWallets = done.wallets
+      cosmeticFlushed = done.flushed
+    }
   }
 
   const takeBook = (): Promise<Book | null> =>
@@ -352,8 +386,7 @@ async function trade(share: number): Promise<void> {
     for (const slot of closing.queue) {
       const wallet = wallets.get(slot.address)
       if (!wallet) continue
-      wallet.lastSkip = "waiting"
-      wallet.dirty = true
+      setSkip(wallet, "waiting")
     }
     noteWindow(db, {
       id: closing.roundId,
@@ -452,7 +485,7 @@ async function trade(share: number): Promise<void> {
         const clock = byAddress.get(wallet.address)
         if (!clock) continue
         if (clock.cursor !== wallet.clock.cursor || clock.visitEnd !== wallet.clock.visitEnd || clock.gapEnd !== wallet.clock.gapEnd) {
-          wallet.dirty = true
+          wallet.cosmeticDirty = true
         }
         wallet.clock = clock
       }
@@ -470,7 +503,7 @@ async function trade(share: number): Promise<void> {
             readyWindow: joinId + (wallet.index % 3),
           }
         }
-        wallet.dirty = true
+        wallet.cosmeticDirty = true
         arrivedMinute += 1
         recent.push({ index: wallet.index, at: now })
       }
@@ -479,7 +512,7 @@ async function trade(share: number): Promise<void> {
         if (!wallet || !wallet.online) continue
         wallet.online = false
         wallet.sleptAt = now
-        wallet.dirty = true
+        wallet.cosmeticDirty = true
         leftMinute += 1
       }
       // Warm keep: a handful of funded wallets stay online so the book is never empty.
@@ -489,7 +522,7 @@ async function trade(share: number): Promise<void> {
         if (!wallet || !wallet.enrolled || !wallet.bound || wallet.online) continue
         wallet.online = true
         wallet.wokeAt = now
-        wallet.dirty = true
+        wallet.cosmeticDirty = true
         arrivedMinute += 1
         recent.push({ index: wallet.index, at: now })
       }
@@ -586,10 +619,11 @@ async function trade(share: number): Promise<void> {
             points: livePoints,
             config: swarmConfig.persona,
           })
+          const admittedJson = JSON.stringify(admitted.gate)
+          if (admittedJson !== JSON.stringify(wallet.gate)) wallet.cosmeticDirty = true
           wallet.gate = admitted.gate
-          wallet.dirty = true
           if (admitted.action === "skip") {
-            wallet.lastSkip = admitted.reason
+            setSkip(wallet, admitted.reason)
             skips += 1
             continue
           }
@@ -641,8 +675,7 @@ async function trade(share: number): Promise<void> {
             for (const slot of released.dropped) {
               const wallet = wallets.get(slot.address)
               if (!wallet) continue
-              wallet.lastSkip = "waiting"
-              wallet.dirty = true
+              setSkip(wallet, "waiting")
               windowStats.skips += 1
             }
             const livePoints = pointsOf(source.tape, at)
@@ -658,8 +691,7 @@ async function trade(share: number): Promise<void> {
               const wallet = wallets.get(slot.address)
               if (!wallet) continue
               if (wallet.funded === false) {
-                wallet.lastSkip = "unfunded"
-                wallet.dirty = true
+                setSkip(wallet, "unfunded")
                 windowStats.skips += 1
                 continue
               }
@@ -684,10 +716,11 @@ async function trade(share: number): Promise<void> {
                 stake: swarmConfig.stake,
                 timing: swarmConfig.timing,
               })
+              const decisionJson = JSON.stringify(decision.gate)
+              if (decisionJson !== JSON.stringify(wallet.gate)) wallet.cosmeticDirty = true
               wallet.gate = decision.gate
-              wallet.dirty = true
               if (decision.action === "skip") {
-                wallet.lastSkip = decision.reason
+                setSkip(wallet, decision.reason)
                 windowStats.skips += 1
                 continue
               }
@@ -700,8 +733,7 @@ async function trade(share: number): Promise<void> {
               for (const slot of wave.queue) {
                 const wallet = wallets.get(slot.address)
                 if (!wallet) continue
-                wallet.lastSkip = "waiting"
-                wallet.dirty = true
+                setSkip(wallet, "waiting")
                 windowStats.skips += 1
               }
               wave.queue = []
@@ -775,6 +807,7 @@ async function trade(share: number): Promise<void> {
     await sleep(wait)
   }
   flush(false)
+  flushCosmetics()
 }
 
 function steering(): {
@@ -831,6 +864,7 @@ function remember(
     token: row?.token ?? null,
     bound: false,
     dirty: false,
+    cosmeticDirty: false,
   })
 }
 
@@ -885,6 +919,41 @@ function toRow(wallet: LiveWallet): WalletRow {
     token: wallet.token,
   }
 }
+
+/** P1-4 item 4: skip diagnostics persist on the cosmetic path. The value guard
+ *  keeps an unchanged reason from rewriting the wallet row every tick. */
+function setSkip(wallet: LiveWallet, reason: string | null) {
+  if (wallet.lastSkip === reason) return
+  wallet.lastSkip = reason
+  wallet.cosmeticDirty = true
+}
+
+/** Cosmetic columns only; the critical columns never pass through this shape. */
+function cosmeticRow(wallet: LiveWallet): CosmeticWalletRow {
+  return {
+    address: wallet.address,
+    online: wallet.online ? 1 : 0,
+    lastSkip: wallet.lastSkip,
+    rngA: wallet.gate.rngA,
+    gateJson: JSON.stringify(wallet.gate),
+    cursor: wallet.clock.cursor,
+    visitStart: wallet.clock.visitStart,
+    visitEnd: wallet.clock.visitEnd,
+    gapEnd: wallet.clock.gapEnd,
+    wokeAt: wallet.wokeAt,
+    sleptAt: wallet.sleptAt,
+    updatedAt: Date.now(),
+  }
+}
+
+/** Cosmetic persistence cadence. Presence, gate, and skip state may lag a few
+ *  seconds after a crash; bankroll, enrollment, and tokens never do. */
+function cosmeticFlushMs(): number {
+  const raw = Number(process.env.AGENT_COSMETIC_FLUSH_MS ?? "")
+  if (Number.isFinite(raw) && raw >= 1_000) return Math.min(60_000, Math.floor(raw))
+  return 5_000
+}
+const COSMETIC_FLUSH_MS = cosmeticFlushMs()
 
 function enrollRank(wallet: LiveWallet): [number, number, number, number] {
   // Restless (frequent traders) first, then low tempo, then richest, then lowest index.
@@ -1295,7 +1364,7 @@ async function postOrders(
       wallet.bankroll = typeof result.balanceMicros === "number" ? result.balanceMicros : wallet.bankroll - order.stakeMicros
       wallet.lastSide = order.side
       wallet.lastStake = order.stakeMicros
-      wallet.lastSkip = null
+      setSkip(wallet, null)
       wallet.dirty = true
       flow.stakeMicros += order.stakeMicros
       accepted.push(order)
@@ -1325,8 +1394,11 @@ async function audit(wallets: Map<string, LiveWallet>, cursor: number, setCursor
       return
     }
     if (response.ok && response.body.address === wallet.address && typeof response.body.balanceMicros === "number") {
-      wallet.bankroll = response.body.balanceMicros
-      wallet.dirty = true
+      // An unchanged balance is the common case; do not rewrite the row for it.
+      if (wallet.bankroll !== response.body.balanceMicros) {
+        wallet.bankroll = response.body.balanceMicros
+        wallet.dirty = true
+      }
       return
     }
     if (isAuthError(toolError(response))) {
@@ -1445,6 +1517,8 @@ function buildSnapshot(input: {
   }
   dirtyWallets: number
   flushedWallets: number
+  cosmeticWallets: number
+  cosmeticFlushed: number
   writeBytesPerMin: number | null
   dbBytes: number
   walBytes: number
@@ -1499,6 +1573,8 @@ function buildSnapshot(input: {
     walBytes: input.walBytes,
     dirtyWallets: input.dirtyWallets,
     flushedWallets: input.flushedWallets,
+    cosmeticWallets: input.cosmeticWallets,
+    cosmeticFlushed: input.cosmeticFlushed,
   }
 }
 
@@ -1648,6 +1724,8 @@ export function mergeLanes(rows: SwarmSnapshot[]): SwarmSnapshot {
     // process, so the newest lane's numbers stand via the spread above.
     dirtyWallets: rows.reduce((sum, row) => sum + (row.dirtyWallets ?? 0), 0),
     flushedWallets: rows.reduce((sum, row) => sum + (row.flushedWallets ?? 0), 0),
+    cosmeticWallets: rows.reduce((sum, row) => sum + (row.cosmeticWallets ?? 0), 0),
+    cosmeticFlushed: rows.reduce((sum, row) => sum + (row.cosmeticFlushed ?? 0), 0),
     arrivedMinute: rows.reduce((sum, row) => sum + row.arrivedMinute, 0),
     leftMinute: rows.reduce((sum, row) => sum + row.leftMinute, 0),
     target: rows.reduce((sum, row) => sum + row.target, 0),

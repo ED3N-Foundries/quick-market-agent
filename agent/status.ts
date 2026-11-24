@@ -74,6 +74,9 @@ export type SwarmSnapshot = {
   /** Wallet rows the latest flush found dirty, and the rows it wrote back. */
   dirtyWallets?: number
   flushedWallets?: number
+  /** Cosmetic rows (presence/gate/skip) the latest cosmetic flush found and wrote. */
+  cosmeticWallets?: number
+  cosmeticFlushed?: number
 }
 
 export function emptyControl(): ControlFile {
