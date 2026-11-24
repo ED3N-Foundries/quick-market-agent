@@ -90,8 +90,21 @@ export type RosterFilter = "all" | "stuck" | "richest" | "woke" | "slept"
 export type RosterSort = "bankroll" | "wins" | "updated" | "idx" | "woke" | "slept"
 export type RosterDir = "asc" | "desc"
 
+/** The agent rewrites the same rows all day on an SD card. Fewer, larger WAL
+ *  checkpoints and a capped journal keep the write churn down. */
+const AGENT_TUNE = { walAutocheckpoint: 10_000, journalSizeLimit: 64 * 1024 * 1024 } as const
+
 export function openSwarm(source: string | Database): Database {
-  const db = typeof source === "string" ? openFile(source) : source
+  let db: Database
+  if (typeof source === "string") {
+    db = openFile(source)
+  } else {
+    // The runtime handle arrives from getDb(), which tunes it with the market's
+    // defaults. The pragmas are idempotent, so the agent settings land here
+    // without reopening the database.
+    tuneDatabase(source, { memory: source.filename === ":memory:" || source.filename === "", ...AGENT_TUNE })
+    db = source
+  }
   db.exec(SCHEMA)
   const columns = db.query("PRAGMA table_info(wallets)").all() as { name: string }[]
   if (columns.length > 0 && !columns.some((column) => column.name === "token")) {
@@ -103,7 +116,7 @@ export function openSwarm(source: string | Database): Database {
 function openFile(source: string): Database {
   if (source !== ":memory:") mkdirSync(dirname(source), { recursive: true })
   const db = new Database(source)
-  tuneDatabase(db, { memory: source === ":memory:" })
+  tuneDatabase(db, { memory: source === ":memory:", ...AGENT_TUNE })
   return db
 }
 

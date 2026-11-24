@@ -44,6 +44,11 @@ function sample(): SwarmSnapshot {
     pin: 30,
     apiHost: "quick-market:3001",
     apiIp: "172.19.0.4",
+    writeBytesPerMin: 5_000,
+    dbBytes: 142_000_000,
+    walBytes: 8_000_000,
+    dirtyWallets: 12,
+    flushedWallets: 12,
   }
 }
 
@@ -82,6 +87,11 @@ test("the handler returns status, averages, and no secrets", async () => {
   expect(body.onlineAvg).toBe(20)
   expect(body.skipRate).toBe(skipRate(4, 26))
   expect(body.skipRate).toBeCloseTo(26 / 30)
+  expect(body.writeBytesPerMin).toBe(5_000)
+  expect(body.dbBytes).toBe(142_000_000)
+  expect(body.walBytes).toBe(8_000_000)
+  expect(body.dirtyWallets).toBe(12)
+  expect(body.flushedWallets).toBe(12)
   expect(body.money.histogram.length).toBeGreaterThan(0)
   const encoded = JSON.stringify(body)
   expect(encoded).not.toContain("secret-key")
@@ -105,6 +115,17 @@ test("an empty window has no skip rate", () => {
   if (body.at == null) throw new Error("expected a live snapshot")
   expect(body.skipRate).toBeNull()
   expect(body.onlineAvg).toBeNull()
+})
+
+test("a snapshot from before the write meters still reports a health body", () => {
+  const { writeBytesPerMin, dbBytes, walBytes, dirtyWallets, flushedWallets, ...before } = sample()
+  const body = statsBody(before)
+  if (body.at == null) throw new Error("expected a live snapshot")
+  expect(body.writeBytesPerMin).toBeNull()
+  expect(body.dbBytes).toBe(0)
+  expect(body.walBytes).toBe(0)
+  expect(body.dirtyWallets).toBe(0)
+  expect(body.flushedWallets).toBe(0)
 })
 
 test("publishStats is what the listener serves", async () => {

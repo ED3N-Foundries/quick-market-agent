@@ -28,9 +28,11 @@ export type SettledRound = {
 
 type ToolContent = { content?: { type: string; text?: string }[]; isError?: boolean }
 
-type Session = {
+export type Session = {
   endpoint: string
   client: Client | null
+  /** The transport behind `client`, kept so a reconnect can DELETE the old session. */
+  transport: StreamableHTTPClientTransport | null
   opening: Promise<void> | null
 }
 
@@ -56,10 +58,10 @@ function withTimeout<T>(work: Promise<T>, ms: number): Promise<T> {
 
 const sessions = new Map<string, Session>()
 
-function sessionFor(chain: string): Session {
+export function sessionFor(chain: string): Session {
   let row = sessions.get(chain)
   if (!row) {
-    row = { endpoint: "", client: null, opening: null }
+    row = { endpoint: "", client: null, transport: null, opening: null }
     sessions.set(chain, row)
   }
   return row
@@ -187,11 +189,17 @@ async function once(row: Session, name: string, args: Record<string, unknown>, t
   return { ok: result.isError !== true && !("error" in body), body: body as ToolBody, transport: false }
 }
 
-async function reconnect(row: Session): Promise<void> {
+export async function reconnect(row: Session): Promise<void> {
   if (row.opening) return row.opening
   row.opening = (async () => {
     const previous = row.client
+    const previousTransport = row.transport
     row.client = null
+    row.transport = null
+    // Client.close() aborts the socket without telling the market, so the old
+    // session and its SSE stream would stay open server-side. DELETE first; a
+    // failure just leaves the market's session TTL as the backstop.
+    if (previousTransport) await withTimeout(previousTransport.terminateSession(), CALL_TIMEOUT_MS).catch(() => undefined)
     if (previous) await withTimeout(previous.close().catch(() => undefined), CALL_TIMEOUT_MS).catch(() => undefined)
     row.client = await connect(row)
   })()
@@ -211,8 +219,10 @@ async function currentClient(row: Session): Promise<Client> {
 async function connect(row: Session): Promise<Client> {
   if (!row.endpoint) throw new Error("The book is unreachable")
   const next = new Client({ name: "quick-market-agent", version: "1.0.0" })
+  const transport = new StreamableHTTPClientTransport(new URL(row.endpoint))
   try {
-    await withTimeout(next.connect(new StreamableHTTPClientTransport(new URL(row.endpoint))), CALL_TIMEOUT_MS)
+    await withTimeout(next.connect(transport), CALL_TIMEOUT_MS)
+    row.transport = transport
     return next
   } catch (error) {
     await next.close().catch(() => undefined)

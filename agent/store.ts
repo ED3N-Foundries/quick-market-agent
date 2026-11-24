@@ -16,9 +16,11 @@ export function readJson(path: string): unknown {
   }
 }
 
-export function writeJsonAtomic(path: string, value: unknown) {
+export function writeJsonAtomic(path: string, value: unknown, pretty = true) {
   mkdirSync(dirname(path), { recursive: true })
   const tmp = `${path}.${process.pid}.tmp`
-  writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`)
+  // The per-second status files ride the compact form; the operator's control
+  // file keeps the readable default.
+  writeFileSync(tmp, `${pretty ? JSON.stringify(value, null, 2) : JSON.stringify(value)}\n`)
   renameSync(tmp, path)
 }

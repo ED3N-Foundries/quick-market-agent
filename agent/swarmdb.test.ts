@@ -3,6 +3,7 @@ import { expect, test } from "bun:test"
 import { mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { tuneDatabase } from "../server/db"
 import {
   loadWalletMap,
   metaGet,
@@ -17,6 +18,11 @@ import {
   stakesFor,
   type WalletRow,
 } from "./swarmdb"
+
+function pragma(db: Database, name: string): number {
+  const row = db.query(`PRAGMA ${name}`).get() as Record<string, number>
+  return Number(Object.values(row)[0])
+}
 
 function wallet(address: string, bankroll: number): WalletRow {
   return {
@@ -178,5 +184,50 @@ test("a diagnostic meta batch lands in one transaction", () => {
     }
   } finally {
     db.close()
+  }
+})
+
+test("the agent DB checkpoints the WAL every 10k pages and caps the journal at 64 MB", () => {
+  const dir = mkdtempSync(join(tmpdir(), "swarm-"))
+  const db = openSwarm(join(dir, "swarm.sqlite"))
+  try {
+    expect(pragma(db, "wal_autocheckpoint")).toBe(10_000)
+    expect(pragma(db, "journal_size_limit")).toBe(64 * 1024 * 1024)
+  } finally {
+    db.close()
+  }
+})
+
+test("a handle opened with the market defaults still gets the agent tuning", () => {
+  const dir = mkdtempSync(join(tmpdir(), "swarm-"))
+  const opened = new Database(join(dir, "swarm.sqlite"))
+  tuneDatabase(opened)
+  expect(pragma(opened, "wal_autocheckpoint")).toBe(1000)
+  const db = openSwarm(opened)
+  try {
+    expect(pragma(db, "wal_autocheckpoint")).toBe(10_000)
+    expect(pragma(db, "journal_size_limit")).toBe(64 * 1024 * 1024)
+  } finally {
+    db.close()
+  }
+})
+
+test("tuneDatabase defaults keep the market settings and memory DBs skip WAL", () => {
+  const dir = mkdtempSync(join(tmpdir(), "swarm-"))
+  const file = new Database(join(dir, "swarm.sqlite"))
+  try {
+    tuneDatabase(file)
+    expect((file.query("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode).toBe("wal")
+    expect(pragma(file, "wal_autocheckpoint")).toBe(1000)
+    expect(pragma(file, "journal_size_limit")).toBe(-1)
+  } finally {
+    file.close()
+  }
+  const memory = new Database(":memory:")
+  try {
+    tuneDatabase(memory, { memory: true })
+    expect((memory.query("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode).toBe("memory")
+  } finally {
+    memory.close()
   }
 })

@@ -66,6 +66,14 @@ export type SwarmSnapshot = {
   apiHost?: string
   /** Addresses that host resolved to. Null until DNS answers. */
   apiIp?: string | null
+  /** Whole-process write rate from /proc/self/io. Null until a second sample exists. */
+  writeBytesPerMin?: number | null
+  /** Agent DB and WAL file sizes in bytes. */
+  dbBytes?: number
+  walBytes?: number
+  /** Wallet rows the latest flush found dirty, and the rows it wrote back. */
+  dirtyWallets?: number
+  flushedWallets?: number
 }
 
 export function emptyControl(): ControlFile {

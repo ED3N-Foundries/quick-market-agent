@@ -1,5 +1,8 @@
 import { expect, test } from "bun:test"
-import { liveBook, marketUrl, recentRounds, settledRounds } from "./mcp"
+import type { Client } from "@modelcontextprotocol/sdk/client/index.js"
+import type { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js"
+import { activeChainKey } from "../server/activeChain"
+import { callMarket, liveBook, marketUrl, recentRounds, reconnect, sessionFor, settledRounds, type Session } from "./mcp"
 
 test("the runner talks to the public MCP URL for its chain", () => {
   expect(marketUrl("http://quick-market:3001", "base-sepolia")).toBe("http://quick-market:3001/mcp?chain=base-sepolia")
@@ -45,4 +48,75 @@ test("book and rounds map onto the runner book", () => {
     { id: 8, winningSide: "up" },
     { id: 9, winningSide: "down" },
   ])
+})
+
+test("a reconnect sends DELETE for the old session before closing it", async () => {
+  const calls: string[] = []
+  const row: Session = {
+    endpoint: "",
+    client: {
+      close: () => {
+        calls.push("close")
+        return Promise.resolve()
+      },
+    } as unknown as Client,
+    transport: {
+      terminateSession: () => {
+        calls.push("delete")
+        return Promise.resolve()
+      },
+    } as unknown as StreamableHTTPClientTransport,
+    opening: null,
+  }
+  // The empty endpoint makes the fresh connect fail after the old session retired.
+  await expect(reconnect(row)).rejects.toThrow("The book is unreachable")
+  expect(calls).toEqual(["delete", "close"])
+})
+
+test("a DELETE that cannot reach the market does not stop the reconnect", async () => {
+  const calls: string[] = []
+  const row: Session = {
+    endpoint: "",
+    client: {
+      close: () => {
+        calls.push("close")
+        return Promise.resolve()
+      },
+    } as unknown as Client,
+    transport: {
+      terminateSession: () => {
+        calls.push("delete")
+        return Promise.reject(new Error("fetch failed"))
+      },
+    } as unknown as StreamableHTTPClientTransport,
+    opening: null,
+  }
+  await expect(reconnect(row)).rejects.toThrow("The book is unreachable")
+  expect(calls).toEqual(["delete", "close"])
+})
+
+test("a timed-out market call keeps the session and sends no DELETE", async () => {
+  const calls: string[] = []
+  const row = sessionFor(activeChainKey())
+  row.endpoint = ""
+  row.client = {
+    callTool: () => new Promise(() => {}),
+  } as unknown as Client
+  row.transport = {
+    terminateSession: () => {
+      calls.push("delete")
+      return Promise.resolve()
+    },
+  } as unknown as StreamableHTTPClientTransport
+  try {
+    const reply = await callMarket("book", {}, 25)
+    // A slow call is not a lost session: no reconnect, no DELETE, no rebind.
+    expect(reply.transport).toBe(false)
+    expect(reply.sessionLost).toBeUndefined()
+    expect(calls).toEqual([])
+  } finally {
+    row.client = null
+    row.transport = null
+    row.endpoint = ""
+  }
 })

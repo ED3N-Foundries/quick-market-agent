@@ -27,6 +27,7 @@ import { replayPayouts } from "./replay"
 import { peekApiEndpoint, refreshApiEndpoint } from "./endpoint"
 import { histogram, manilaClock, parseControl, parseFlow, percentiles, type FlowFile, type SwarmSnapshot } from "./status"
 import { publishStats, startStatsServer } from "./stats"
+import { dbFileSizes, readSelfIo, writeBytesPerMinute, type SelfIoSample } from "./writes"
 import { CONTROL_PATH, FLOW_PATH, KEYS_PATH, NEAR_KEYS_PATH, STATUS_PATH, SWARM_PATH, readJson, writeJsonAtomic } from "./store"
 import {
   loadWalletMap,
@@ -180,7 +181,8 @@ async function trade(share: number): Promise<void> {
   }
 
   const db = getDb()
-  importLegacySwarm(db, loadEnv().dbPath)
+  const dbPath = loadEnv().dbPath
+  importLegacySwarm(db, dbPath)
   openSwarm(db)
   pruneUnenrolled(db)
   const windowKey = String(windowMs())
@@ -281,9 +283,17 @@ async function trade(share: number): Promise<void> {
   let lastView: DirectorView | null = null
   let stopping = false
   let flushAt = 0
+  let ioSample: SelfIoSample | null = null
 
   const flush = (running = !stopping) => {
-    const dirty = [...wallets.values()].filter((wallet) => wallet.dirty && wallet.enrolled).map((wallet) => toRow(wallet))
+    let dirtyWallets = 0
+    const dirty: WalletRow[] = []
+    for (const wallet of wallets.values()) {
+      if (!wallet.dirty) continue
+      dirtyWallets += 1
+      if (wallet.enrolled) dirty.push(toRow(wallet))
+    }
+    const flushedWallets = dirty.length
     saveWallets(db, dirty)
     for (const wallet of wallets.values()) if (wallet.enrolled) wallet.dirty = false
     metaSetMany(db, [
@@ -296,8 +306,15 @@ async function trade(share: number): Promise<void> {
       ["last_error", lastError ?? ""],
       ["bound", String(walletsBound(wallets))],
     ])
+    // Write-path meters for the P1-4 gate: the whole-process write rate from
+    // /proc/self/io, the DB/WAL sizes, and the rows this flush wrote back.
+    const now = Date.now()
+    const io = readSelfIo()
+    const writeBytesPerMin = io && ioSample ? writeBytesPerMinute(ioSample, { at: now, writeBytes: io.writeBytes }) : null
+    if (io) ioSample = { at: now, writeBytes: io.writeBytes }
+    const sizes = dbFileSizes(dbPath)
     const snapshot = buildSnapshot({
-      now: Date.now(),
+      now,
       view: lastView,
       director,
       wallets,
@@ -309,6 +326,11 @@ async function trade(share: number): Promise<void> {
       leftMinute,
       trace,
       windowStats,
+      dirtyWallets,
+      flushedWallets,
+      writeBytesPerMin,
+      dbBytes: sizes.dbBytes,
+      walBytes: sizes.walBytes,
       running,
     })
     publishLane(activeChainKey(), snapshot, flow)
@@ -1421,6 +1443,11 @@ function buildSnapshot(input: {
     rejected: number
     lastReject: string | null
   }
+  dirtyWallets: number
+  flushedWallets: number
+  writeBytesPerMin: number | null
+  dbBytes: number
+  walBytes: number
   running: boolean
 }): SwarmSnapshot {
   const steered = steering()
@@ -1467,6 +1494,11 @@ function buildSnapshot(input: {
     pin: steered.pin,
     apiHost: endpoint.host,
     apiIp: endpoint.ip,
+    writeBytesPerMin: input.writeBytesPerMin,
+    dbBytes: input.dbBytes,
+    walBytes: input.walBytes,
+    dirtyWallets: input.dirtyWallets,
+    flushedWallets: input.flushedWallets,
   }
 }
 
@@ -1571,7 +1603,9 @@ function laneFlowPath(chain: string): string {
 
 function publishLane(chain: string, snapshot: SwarmSnapshot, flow: FlowFile) {
   lanePublish.set(chain, { snapshot, flow })
-  writeJsonAtomic(laneFlowPath(chain), flow)
+  // These files are rewritten every second and machine-read; compact JSON cuts
+  // the write bytes. The operator's control file keeps the pretty default.
+  writeJsonAtomic(laneFlowPath(chain), flow, false)
   const rows = [...lanePublish.values()]
   const merged = rows.length === 1 ? rows[0]!.snapshot : mergeLanes(rows.map((row) => row.snapshot))
   const flowSum = rows.reduce(
@@ -1584,9 +1618,9 @@ function publishLane(chain: string, snapshot: SwarmSnapshot, flow: FlowFile) {
     { seedMicros: 0, mintMicros: 0, burnMicros: 0, stakeMicros: 0 },
   )
   publishStats(merged)
-  writeJsonAtomic(SWARM_PATH, merged)
-  writeJsonAtomic(STATUS_PATH, merged)
-  writeJsonAtomic(FLOW_PATH, flowSum)
+  writeJsonAtomic(SWARM_PATH, merged, false)
+  writeJsonAtomic(STATUS_PATH, merged, false)
+  writeJsonAtomic(FLOW_PATH, flowSum, false)
 }
 
 /** Heads and stakes add. The spring is the shared clock, so it stays the max, not a sum. */
@@ -1610,6 +1644,10 @@ export function mergeLanes(rows: SwarmSnapshot[]): SwarmSnapshot {
     online: rows.reduce((sum, row) => sum + row.online, 0),
     enrolled: rows.reduce((sum, row) => sum + (row.enrolled ?? 0), 0),
     bound: rows.reduce((sum, row) => sum + (row.bound ?? 0), 0),
+    // Per-flush row counts add across lanes; the write meter reads the whole
+    // process, so the newest lane's numbers stand via the spread above.
+    dirtyWallets: rows.reduce((sum, row) => sum + (row.dirtyWallets ?? 0), 0),
+    flushedWallets: rows.reduce((sum, row) => sum + (row.flushedWallets ?? 0), 0),
     arrivedMinute: rows.reduce((sum, row) => sum + row.arrivedMinute, 0),
     leftMinute: rows.reduce((sum, row) => sum + row.leftMinute, 0),
     target: rows.reduce((sum, row) => sum + row.target, 0),

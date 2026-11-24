@@ -55,6 +55,14 @@ export type AgentHealthLive = {
   pin: number | null
   apiHost: string | null
   apiIp: string | null
+  /** Whole-process write rate from /proc/self/io; null until a second sample exists. */
+  writeBytesPerMin: number | null
+  /** Agent DB and WAL file sizes in bytes. */
+  dbBytes: number
+  walBytes: number
+  /** Wallet rows the latest flush found dirty, and the rows it wrote back. */
+  dirtyWallets: number
+  flushedWallets: number
   onlineAvg: number | null
   skipRate: number | null
 }
@@ -147,6 +155,12 @@ export function statsBody(snapshot: SwarmSnapshot | null = latest): AgentHealthB
     pin: typeof snapshot.pin === "number" && Number.isFinite(snapshot.pin) ? snapshot.pin : null,
     apiHost: typeof snapshot.apiHost === "string" ? snapshot.apiHost.slice(0, 200) : null,
     apiIp: typeof snapshot.apiIp === "string" ? snapshot.apiIp.slice(0, 200) : null,
+    writeBytesPerMin:
+      typeof snapshot.writeBytesPerMin === "number" && Number.isFinite(snapshot.writeBytesPerMin) ? snapshot.writeBytesPerMin : null,
+    dbBytes: finite(snapshot.dbBytes ?? 0),
+    walBytes: finite(snapshot.walBytes ?? 0),
+    dirtyWallets: finite(snapshot.dirtyWallets ?? 0),
+    flushedWallets: finite(snapshot.flushedWallets ?? 0),
     onlineAvg: onlineAverage(trace),
     skipRate: skipRate(book.buyIns, book.skips),
   }

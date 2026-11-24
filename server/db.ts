@@ -150,8 +150,17 @@ const SCHEMA = `${Object.values(CHAIN_TABLES).join(";\n")};\n${SHARED_TABLES}`
 
 let database: Database | null = null
 
+export type TuneOptions = {
+  readonly?: boolean
+  memory?: boolean
+  /** WAL pages between auto-checkpoints. Defaults to the market's 1000. */
+  walAutocheckpoint?: number
+  /** Byte cap the WAL is trimmed to after a checkpoint. Unset keeps SQLite's default. */
+  journalSizeLimit?: number
+}
+
 /** Connection settings only. Does not migrate or write schema. */
-export function tuneDatabase(db: Database, options: { readonly?: boolean; memory?: boolean } = {}) {
+export function tuneDatabase(db: Database, options: TuneOptions = {}) {
   if (!options.readonly && !options.memory) db.exec("PRAGMA journal_mode = WAL;")
   db.exec("PRAGMA foreign_keys = ON;")
   db.exec("PRAGMA busy_timeout = 5000;")
@@ -159,7 +168,11 @@ export function tuneDatabase(db: Database, options: { readonly?: boolean; memory
   db.exec("PRAGMA temp_store = MEMORY;")
   db.exec("PRAGMA cache_size = -20000;")
   db.exec("PRAGMA mmap_size = 268435456;")
-  if (!options.readonly && !options.memory) db.exec("PRAGMA wal_autocheckpoint = 1000;")
+  if (!options.readonly && !options.memory) {
+    db.exec(`PRAGMA wal_autocheckpoint = ${options.walAutocheckpoint ?? 1000};`)
+    // The WAL cap only applies once WAL mode is on, so it lands after the switch above.
+    if (options.journalSizeLimit !== undefined) db.exec(`PRAGMA journal_size_limit = ${options.journalSizeLimit};`)
+  }
 }
 
 function openDatabase(path: string): Database {

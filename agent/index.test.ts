@@ -43,6 +43,32 @@ test("merged lanes add the crowds and keep one spring", () => {
   expect(merged.phase).toBe("peak")
 })
 
+test("merged lanes add the flush counters and keep one write meter", () => {
+  const base = snapshot({
+    at: 1,
+    dirtyWallets: 30,
+    flushedWallets: 28,
+    dbBytes: 1_000,
+    walBytes: 2_000,
+    writeBytesPerMin: 6_000,
+  })
+  const near = snapshot({
+    at: 2,
+    dirtyWallets: 9,
+    flushedWallets: 9,
+    dbBytes: 1_000,
+    walBytes: 2_000,
+    writeBytesPerMin: 5_000,
+  })
+  const merged = mergeLanes([base, near])
+  expect(merged.dirtyWallets).toBe(39)
+  expect(merged.flushedWallets).toBe(37)
+  // The meter reads the whole process, so the newest lane's numbers stand.
+  expect(merged.dbBytes).toBe(1_000)
+  expect(merged.walBytes).toBe(2_000)
+  expect(merged.writeBytesPerMin).toBe(5_000)
+})
+
 function snapshot(patch: Partial<SwarmSnapshot> & { buyIns?: number }): SwarmSnapshot {
   return {
     at: patch.at ?? 0,
@@ -76,6 +102,11 @@ function snapshot(patch: Partial<SwarmSnapshot> & { buyIns?: number }): SwarmSna
     bleed: true,
     mode: "clock",
     pin: null,
+    writeBytesPerMin: patch.writeBytesPerMin ?? null,
+    dbBytes: patch.dbBytes ?? 0,
+    walBytes: patch.walBytes ?? 0,
+    dirtyWallets: patch.dirtyWallets ?? 0,
+    flushedWallets: patch.flushedWallets ?? 0,
   }
 }
 
